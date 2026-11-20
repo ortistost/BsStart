@@ -119,25 +119,30 @@ object SlotStore {
 
 object TrophyParser {
     const val MAX_PLAUSIBLE = 2000
+    private val DIGITLIKE = Regex("^[0-9OolI|]{1,5}$")
 
-    // Okunamazsa veya makul değilse null
+    // Satır satır okur; okunamazsa veya makul değilse null
     fun parse(raw: String?): Int? {
         if (raw == null) return null
-        val s = raw.filter { !it.isWhitespace() }
-        if (s.isEmpty()) return null
-        val src = if (Regex("^[0-9OolI|]{1,5}$").matches(s))
-            s.map {
-                when (it) {
-                    'O', 'o' -> '0'
-                    'I', 'l', '|' -> '1'
-                    else -> it
-                }
-            }.joinToString("")
-        else s
-        val groups = Regex("\\d+").findAll(src).map { it.value }.filter { it.length <= 4 }.toList()
-        if (groups.isEmpty()) return null
-        val best = groups.maxByOrNull { it.length } ?: return null
-        val v = best.toIntOrNull() ?: return null
-        return if (v in 0..MAX_PLAUSIBLE) v else null
+        val found = ArrayList<Int>()
+        for (line in raw.lines()) {
+            val s = line.filter { !it.isWhitespace() }
+            if (s.isEmpty()) continue
+            val t = if (DIGITLIKE.matches(s))
+                s.map {
+                    when (it) {
+                        'O', 'o' -> '0'
+                        'I', 'l', '|' -> '1'
+                        else -> it
+                    }
+                }.joinToString("")
+            else s
+            for (m in Regex("\\d+").findAll(t)) {
+                if (m.value.length > 4) continue
+                val v = m.value.toIntOrNull() ?: continue
+                if (v in 0..MAX_PLAUSIBLE) found.add(v)
+            }
+        }
+        return found.maxWithOrNull(compareBy<Int>({ it.toString().length }, { it }))
     }
 }
