@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">BS Start</string>
+    <string name="service_desc">Ekranda yüzen bir buton gösterir ve kayıtlı noktaya dokunma gönderir.</string>
+</resources>
