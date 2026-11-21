@@ -14,6 +14,7 @@ import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
@@ -25,37 +26,58 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
+
+// Uygulama (MainActivity) ile servis aynı süreçte; paneli buradan aç/gizler
+object ServiceBridge {
+    @Volatile var service: StartService? = null
+}
 
 class StartService : AccessibilityService() {
 
     private enum class Phase { LOOP, READING, SWITCH }
+    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, CLIP, SCREEN, HELP, CROSS }
 
     private lateinit var wm: WindowManager
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences(SlotStore.PREFS, MODE_PRIVATE) }
+    private val logPrefs by lazy { getSharedPreferences("bslog", MODE_PRIVATE) }
     private val prefListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refreshMarkers() }
 
     private var panel: LinearLayout? = null
-    private var mainBtn: View? = null
+    private var panelLp: WindowManager.LayoutParams? = null
+    private var panelShown = true
+    private var mainItem: Item? = null
+    private var eyeItem: Item? = null
     private var calibLayer: View? = null
     private var markers: MarkerView? = null
     private var markersOn = true
     private var readLabel: String? = null
     private var labelToken = 0
+    private var rectToken = 0
+    private var rectPending = false
+
+    private var undoSnap: HashMap<String, Any?>? = null
+    private var undoNext = 1
 
     private var running = false
     private var shotBusy = false
+    private var shotFails = 0
     private var nextSlot = 1
     private var lastPkg: String? = null
+    private var pkgSince = 0L
+    private var lastProgressMs = 0L
 
     // Maç kapısı
     private var inMatch = false
@@ -87,7 +109,6 @@ class StartService : AccessibilityService() {
         const val SLOTS = SlotStore.SLOTS
         const val PLAY = 1
         const val ATTACK = 2
-        const val EXIT = 5
         const val BRAWLERS = 6
         const val CHARACTER = 7
         const val SELECT = 8
@@ -111,14 +132,17 @@ class StartService : AccessibilityService() {
         const val COLOR_TOLERANCE = 35       // kalibre edilmedi
         const val SAMPLE_RADIUS = 3
         const val LABEL_MS = 3000L
+        const val FOREIGN_PKG_MS = 15000L
+        const val STUCK_MS = 120000L
+        const val LOG_LINES = 150
 
         const val OCR_TARGET_H = 128
-        const val MAX_READ_ATTEMPTS = 9
-        const val REQUIRED_VOTES = 2
+        const val MAX_READ_ATTEMPTS = 12
+        const val REQUIRED_VOTES = 3
         const val MAX_FAIL_CYCLES = 3
-        const val READ_TIMEOUT_MS = 25000L
+        const val READ_TIMEOUT_MS = 30000L
         const val STEP_TIMEOUT_MS = 12000L   // sadece Savaşçılar düğmesinin görünmesi için
-        const val STEP_DELAY_MS = 10000L     // 6→7 ve 7→8 arası, renge bakmadan
+        const val STEP_DELAY_MS = 5000L      // 6→7 ve 7→8 arası, renge bakmadan
         const val SETTLE_MS = 2500L
     }
 
@@ -128,18 +152,21 @@ class StartService : AccessibilityService() {
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         showMarkers()
         showPanel()
+        ServiceBridge.service = this
+        log("Servis bağlandı")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val p = event.packageName?.toString() ?: return
         if (p == packageName || p == "com.android.systemui") return
-        lastPkg = p
+        if (p != lastPkg) { lastPkg = p; pkgSince = System.currentTimeMillis() }
     }
 
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        if (ServiceBridge.service === this) ServiceBridge.service = null
         running = false
         session++
         ui.removeCallbacksAndMessages(null)
@@ -156,6 +183,18 @@ class StartService : AccessibilityService() {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    // --- Kayıt defteri (son 150 satır, "bslog" içinde) ---
+
+    private fun log(m: String) {
+        try {
+            val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date())
+            val old = logPrefs.getString("l", "") ?: ""
+            val lines = (old.lines().filter { it.isNotEmpty() } + "$t $m").takeLast(LOG_LINES)
+            logPrefs.edit().putString("l", lines.joinToString("\n")).apply()
+        } catch (_: Exception) {}
+    }
 
     // --- Halkalar ve OCR alanı: dokunmayı geçirir ---
 
@@ -220,6 +259,7 @@ class StartService : AccessibilityService() {
     private fun toggleMarkers() {
         markersOn = !markersOn
         markers?.visibility = if (markersOn) View.VISIBLE else View.INVISIBLE
+        eyeItem?.iv?.icon = if (markersOn) Ic.EYE_ON else Ic.EYE_OFF
         toast(if (markersOn) "Halkalar gösteriliyor" else "Halkalar gizli")
     }
 
@@ -236,35 +276,175 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // --- Panel ---
+    // --- Panel simgeleri ---
 
-    private fun circle(color: Int, sizeDp: Int): View = View(this).apply {
-        background = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(color)
-            setStroke(dp(2), Color.WHITE)
+    private inner class IconView(ctx: Context, fillColor: Int, inkColor: Int) : View(ctx) {
+        var icon: Ic = Ic.PLUS
+            set(v) { field = v; invalidate() }
+        var fill: Int = fillColor
+            set(v) { field = v; invalidate() }
+        var ink: Int = inkColor
+            set(v) { field = v; invalidate() }
+
+        private val fillP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val edgeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; color = Color.WHITE
         }
-        layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)).apply {
+        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+        }
+        private val solid = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
+        }
+
+        // Ucu (x,y) + yön*s olan, tabanı (x,y)'de üçgen ok başı
+        private fun head(c: Canvas, x: Float, y: Float, dx: Float, dy: Float, s: Float) {
+            val px = -dy; val py = dx
+            val p = Path().apply {
+                moveTo(x + dx * s, y + dy * s)
+                lineTo(x + px * s * 0.7f, y + py * s * 0.7f)
+                lineTo(x - px * s * 0.7f, y - py * s * 0.7f)
+                close()
+            }
+            c.drawPath(p, solid)
+        }
+
+        override fun onDraw(c: Canvas) {
+            val cx = width / 2f; val cy = height / 2f
+            val rad = min(width, height) / 2f - dp(1)
+            fillP.color = fill
+            c.drawCircle(cx, cy, rad, fillP)
+            edgeP.strokeWidth = dp(2).toFloat()
+            c.drawCircle(cx, cy, rad, edgeP)
+            val r = rad * 0.55f
+            line.color = ink; line.strokeWidth = max(2f, rad * 0.13f)
+            solid.color = ink
+            when (icon) {
+                Ic.MOVE -> {
+                    val dirs = arrayOf(floatArrayOf(1f, 0f), floatArrayOf(-1f, 0f),
+                        floatArrayOf(0f, 1f), floatArrayOf(0f, -1f))
+                    for (d in dirs) {
+                        val ex = cx + d[0] * r * 0.65f; val ey = cy + d[1] * r * 0.65f
+                        c.drawLine(cx, cy, ex, ey, line)
+                        head(c, ex, ey, d[0], d[1], r * 0.35f)
+                    }
+                }
+                Ic.PLAY -> {
+                    val p = Path().apply {
+                        moveTo(cx - r * 0.5f, cy - r * 0.75f)
+                        lineTo(cx - r * 0.5f, cy + r * 0.75f)
+                        lineTo(cx + r * 0.8f, cy)
+                        close()
+                    }
+                    c.drawPath(p, solid)
+                }
+                Ic.STOP -> c.drawRoundRect(
+                    RectF(cx - r * 0.65f, cy - r * 0.65f, cx + r * 0.65f, cy + r * 0.65f),
+                    dp(2).toFloat(), dp(2).toFloat(), solid
+                )
+                Ic.PLUS -> {
+                    c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, line)
+                    c.drawLine(cx, cy - r * 0.8f, cx, cy + r * 0.8f, line)
+                }
+                Ic.MINUS -> c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, line)
+                Ic.UNDO -> {
+                    val rr = r * 0.8f
+                    c.drawArc(RectF(cx - rr, cy - rr, cx + rr, cy + rr), 340f, -240f, false, line)
+                    val a = Math.toRadians(100.0)
+                    val ex = cx + rr * cos(a).toFloat(); val ey = cy + rr * sin(a).toFloat()
+                    head(c, ex, ey, sin(a).toFloat(), -cos(a).toFloat(), r * 0.45f)
+                }
+                Ic.EYE_ON, Ic.EYE_OFF -> {
+                    val p = Path().apply {
+                        moveTo(cx - r, cy)
+                        quadTo(cx, cy - r * 1.3f, cx + r, cy)
+                        quadTo(cx, cy + r * 1.3f, cx - r, cy)
+                        close()
+                    }
+                    c.drawPath(p, line)
+                    c.drawCircle(cx, cy, r * 0.32f, solid)
+                    if (icon == Ic.EYE_OFF)
+                        c.drawLine(cx - r, cy + r * 0.9f, cx + r, cy - r * 0.9f, line)
+                }
+                Ic.CLIP -> {
+                    c.drawRoundRect(
+                        RectF(cx - r * 0.65f, cy - r * 0.75f, cx + r * 0.65f, cy + r * 0.9f),
+                        dp(2).toFloat(), dp(2).toFloat(), line
+                    )
+                    c.drawRect(cx - r * 0.3f, cy - r * 0.95f, cx + r * 0.3f, cy - r * 0.55f, solid)
+                    c.drawLine(cx - r * 0.35f, cy + r * 0.05f, cx + r * 0.35f, cy + r * 0.05f, line)
+                    c.drawLine(cx - r * 0.35f, cy + r * 0.45f, cx + r * 0.35f, cy + r * 0.45f, line)
+                }
+                Ic.SCREEN -> {
+                    c.drawRoundRect(
+                        RectF(cx - r, cy - r * 0.75f, cx + r, cy + r * 0.75f),
+                        dp(2).toFloat(), dp(2).toFloat(), line
+                    )
+                    textP.color = ink; textP.textSize = r * 1.0f
+                    val fm = textP.fontMetrics
+                    c.drawText("9", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+                }
+                Ic.HELP -> {
+                    textP.color = ink; textP.textSize = r * 2f
+                    val fm = textP.fontMetrics
+                    c.drawText("?", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+                }
+                Ic.CROSS -> {
+                    c.drawLine(cx - r * 0.7f, cy - r * 0.7f, cx + r * 0.7f, cy + r * 0.7f, line)
+                    c.drawLine(cx + r * 0.7f, cy - r * 0.7f, cx - r * 0.7f, cy + r * 0.7f, line)
+                }
+            }
+        }
+    }
+
+    // Simge + altında kısa yazı
+    private inner class Item(kind: Ic, fillColor: Int, inkColor: Int, sizeDp: Int, label: String) {
+        val iv = IconView(this@StartService, fillColor, inkColor).apply {
+            icon = kind
+            layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+        val tv = TextView(this@StartService).apply {
+            this.text = label
+            textSize = 9f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            maxLines = 1
+            setShadowLayer(3f, 0f, 0f, Color.BLACK)
+        }
+        val col = LinearLayout(this@StartService).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            topMargin = dp(4)
+            setPadding(0, dp(3), 0, 0)
+            addView(iv); addView(tv)
         }
     }
 
     private fun showPanel() {
-        val handle = circle(Color.parseColor("#FF9800"), 26)   // sürükle; kısa dokunma = yuva atla
-        val main = circle(Color.parseColor("#E53935"), 64)     // döngü aç/kapat
-        val calib = circle(Color.parseColor("#1E88E5"), 26)    // kalibrasyon; uzun = hepsini sil
-        val hide = circle(Color.parseColor("#9E9E9E"), 26)     // halkaları gizle/göster
-        val copy = circle(Color.parseColor("#8E24AA"), 26)     // panoya kopyala
-        val area = circle(Color.parseColor("#00ACC1"), 26)     // kupa alanı seç; uzun = detaylı test
-        val live = circle(Color.parseColor("#FDD835"), 26)     // okumayı dene: OKU (sayı)
-        val off = circle(Color.BLACK, 26)                      // servisi tamamen kapat
-        mainBtn = main
+        val handle = Item(Ic.MOVE, Color.parseColor("#FF9800"), Color.WHITE, 28, "Taşı")
+        val main = Item(Ic.PLAY, Color.parseColor("#E53935"), Color.WHITE, 44, "Başlat")
+        val calib = Item(Ic.PLUS, Color.parseColor("#1E88E5"), Color.WHITE, 28, "Yuva kaydet")
+        val del = Item(Ic.MINUS, Color.parseColor("#B71C1C"), Color.WHITE, 28, "Hepsini sil")
+        val undo = Item(Ic.UNDO, Color.parseColor("#607D8B"), Color.WHITE, 28, "Geri al")
+        val hide = Item(Ic.EYE_ON, Color.parseColor("#9E9E9E"), Color.WHITE, 28, "Halkalar")
+        val copy = Item(Ic.CLIP, Color.parseColor("#8E24AA"), Color.WHITE, 28, "Kopyala")
+        val area = Item(Ic.SCREEN, Color.parseColor("#00ACC1"), Color.WHITE, 28, "Alan seç")
+        val live = Item(Ic.HELP, Color.parseColor("#FDD835"), Color.BLACK, 28, "Test oku")
+        val off = Item(Ic.CROSS, Color.BLACK, Color.parseColor("#FF1744"), 28, "Gizle")
+        mainItem = main
+        eyeItem = hide
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(handle); addView(main); addView(calib)
-            addView(hide); addView(copy); addView(area); addView(live); addView(off)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#B0101820"))
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), Color.parseColor("#66FFFFFF"))
+            }
+            setPadding(dp(6), dp(4), dp(6), dp(6))
+            for (it in listOf(handle, main, calib, del, undo, hide, copy, area, live, off)) addView(it.col)
         }
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -275,12 +455,13 @@ class StartService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(16); y = dp(40)
+            x = dp(8); y = dp(24)
         }
         panel = box
+        panelLp = lp
 
         var downX = 0f; var downY = 0f; var startX = 0; var startY = 0
-        handle.setOnTouchListener { _, e ->
+        handle.iv.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY; startX = lp.x; startY = lp.y
@@ -300,35 +481,101 @@ class StartService : AccessibilityService() {
             true
         }
 
-        main.setOnClickListener { toggleLoop() }
-        calib.setOnClickListener { startCalibration(nextSlot) }
-        calib.setOnLongClickListener { clearSlots(); true }
-        hide.setOnClickListener { toggleMarkers() }
-        copy.setOnClickListener { copySlots() }
-        area.setOnClickListener { selectRect() }
-        area.setOnLongClickListener { testRead(); true }
-        live.setOnClickListener { liveRead() }
-        off.setOnClickListener { shutdown() }
+        // Seçim (yuva / okuma alanı) sürerken panelde herhangi bir butona basmak seçimi iptal eder
+        main.iv.setOnClickListener { if (!cancelPick()) toggleLoop() }
+        calib.iv.setOnClickListener { if (!cancelPick()) startCalibration(nextSlot) }
+        del.iv.setOnClickListener { if (!cancelPick()) clearSlots() }
+        undo.iv.setOnClickListener { if (!cancelPick()) undo() }
+        hide.iv.setOnClickListener { if (!cancelPick()) toggleMarkers() }
+        copy.iv.setOnClickListener { if (!cancelPick()) copySlots() }
+        area.iv.setOnClickListener { if (!cancelPick()) selectRect() }
+        area.iv.setOnLongClickListener { if (!cancelPick()) testRead(); true }
+        live.iv.setOnClickListener { if (!cancelPick()) liveRead() }
+        off.iv.setOnClickListener { if (!cancelPick()) hidePanel() }
 
         wm.addView(box, lp)
     }
 
-    private fun shutdown() {
-        haltLoop()
-        toast("BS Start kapatıldı. Açmak için Erişilebilirlik ayarlarından aç.")
-        disableSelf()
+    // Paneli seçim katmanının üstüne çıkarır (aksi halde katman panele gelen dokunmayı yutar)
+    private fun raisePanel() {
+        val p = panel ?: return
+        val l = panelLp ?: return
+        try { wm.removeView(p) } catch (_: Exception) {}
+        try { wm.addView(p, l) } catch (_: Exception) {}
+    }
+
+    private fun setKeepAwake(on: Boolean) {
+        val p = panel ?: return
+        val l = panelLp ?: return
+        val f = WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        l.flags = if (on) l.flags or f else l.flags and f.inv()
+        try { wm.updateViewLayout(p, l) } catch (_: Exception) {}
+    }
+
+    private fun cancelPick(): Boolean {
+        if (calibLayer == null && !rectPending) return false
+        rectToken++
+        rectPending = false
+        removeView(calibLayer); calibLayer = null
+        toast("Seçim iptal edildi")
+        return true
+    }
+
+    // Erişilebilirliği KAPATMAZ: döngüyü durdurur, paneli ve halkaları gizler, dokunmayı keser
+    fun setPanelVisible(v: Boolean) {
+        panelShown = v
+        if (!v) { cancelPick(); haltLoop() }
+        panel?.visibility = if (v) View.VISIBLE else View.GONE
+        markers?.visibility = if (v && markersOn) View.VISIBLE else View.INVISIBLE
+        log(if (v) "Panel gösterildi" else "Panel gizlendi, döngü durduruldu")
+    }
+
+    fun isPanelVisible() = panelShown
+
+    private fun hidePanel() {
+        setPanelVisible(false)
+        toast("Panel gizlendi. Geri açmak için uygulamadaki düğme.")
     }
 
     // --- Yuvalar ---
 
     private fun slotReady(i: Int) = SlotStore.ready(prefs, i)
 
+    // Son değişiklik için tek seviyelik geri alma
+    private fun saveUndo() {
+        undoSnap = HashMap<String, Any?>(prefs.all)
+        undoNext = nextSlot
+    }
+
+    private fun undo() {
+        val s = undoSnap
+        if (s == null) { toast("Geri alınacak bir şey yok"); return }
+        haltLoop()
+        val e = prefs.edit().clear()
+        for ((k, v) in s) {
+            when (v) {
+                is Float -> e.putFloat(k, v)
+                is Int -> e.putInt(k, v)
+                is Long -> e.putLong(k, v)
+                is Boolean -> e.putBoolean(k, v)
+                is String -> e.putString(k, v)
+                else -> {}
+            }
+        }
+        e.commit()
+        nextSlot = undoNext
+        undoSnap = null
+        refreshMarkers()
+        toast("Son değişiklik geri alındı")
+    }
+
     private fun clearSlots() {
         haltLoop()
+        saveUndo()
         prefs.edit().clear().apply()
         nextSlot = 1
         refreshMarkers()
-        toast("Her şey silindi (yuvalar + okuma alanı), sıradaki: 1 (${SlotStore.NAMES[1]})")
+        toast("Her şey silindi. Geri al ile kurtarabilirsin. Sıradaki: 1 (${SlotStore.NAMES[1]})")
     }
 
     private fun screenBounds() = wm.currentWindowMetrics.bounds
@@ -353,7 +600,12 @@ class StartService : AccessibilityService() {
         val g = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
             .build()
-        lastTapMs[i] = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        lastTapMs[i] = now
+        if (i != ATTACK) {
+            lastProgressMs = now
+            log("Basıldı: $i (${SlotStore.NAMES[i]})")
+        }
         dispatchGesture(g, null, null)
     }
 
@@ -385,14 +637,16 @@ class StartService : AccessibilityService() {
         )
         calibLayer = layer
         wm.addView(layer, lp)
+        raisePanel()
     }
 
     private fun startCalibration(slot: Int) {
-        pickPoint("Yuva $slot (${SlotStore.NAMES[slot]}): düğmeye dokun (basmaz, sadece kaydeder)") { fx, fy ->
+        pickPoint("Yuva $slot (${SlotStore.NAMES[slot]}): düğmeye dokun (basmaz, sadece kaydeder). İptal: panelde bir butona bas") { fx, fy ->
             ui.postDelayed({
                 withScreenshot { bmp ->
                     val c = bmp?.let { sampleColor(it, fx, fy) }
                     if (c != null) {
+                        saveUndo()
                         prefs.edit().putFloat("x$slot", fx).putFloat("y$slot", fy)
                             .putInt("c$slot", c).apply()
                         nextSlot = slot % SLOTS + 1
@@ -407,28 +661,34 @@ class StartService : AccessibilityService() {
     }
 
     private fun selectRect() {
-        pickPoint("Kupa alanı: SOL ÜST köşeye dokun") { x1, y1 ->
+        if (calibLayer != null) return
+        val t = ++rectToken
+        rectPending = true
+        pickPoint("Kupa alanı: SOL ÜST köşeye dokun. İptal: panelde bir butona bas") { x1, y1 ->
             ui.postDelayed({
-                pickPoint("Şimdi SAĞ ALT köşeye dokun") { x2, y2 ->
+                if (t != rectToken) return@postDelayed
+                pickPoint("Şimdi SAĞ ALT köşeye dokun. İptal: panelde bir butona bas") { x2, y2 ->
+                    rectPending = false
                     val l = min(x1, x2); val r = max(x1, x2)
-                    val t = min(y1, y2); val bt = max(y1, y2)
-                    if (r - l < 0.01f || bt - t < 0.005f) {
+                    val tp = min(y1, y2); val bt = max(y1, y2)
+                    if (r - l < 0.01f || bt - tp < 0.005f) {
                         toast("Alan çok küçük, tekrar dene")
                     } else {
-                        prefs.edit().putFloat("ox1", l).putFloat("oy1", t)
+                        saveUndo()
+                        prefs.edit().putFloat("ox1", l).putFloat("oy1", tp)
                             .putFloat("ox2", r).putFloat("oy2", bt).apply()
                         refreshMarkers()
-                        toast("Okuma alanı kaydedildi. Sarı butonla test et.")
+                        toast("Okuma alanı kaydedildi. Test oku ile dene.")
                     }
                 }
             }, 300)
         }
     }
 
-    // Sarı buton: alanı 3 farklı görüntü işlemeyle okur, çerçevede OKU (sayı) / OKU (Yok) gösterir
+    // Test oku: alanı 3 farklı görüntü işlemeyle okur, çerçevede OKU (sayı) / OKU (Yok) gösterir
     private fun liveRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
-        if (running) { toast("Önce döngüyü kapat"); return }
+        if (running) { toast("Önce döngüyü durdur"); return }
         withScreenshot { bmp ->
             if (bmp == null) { showLabel("Yok"); return@withScreenshot }
             val crops = (0..2).map { cropForOcr(bmp, it) }
@@ -452,10 +712,10 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // Turkuaz butona uzun basış: 3 görüntü işlemenin ham sonuçlarını gösterir
+    // Alan seç butonuna uzun basış: 3 görüntü işlemenin ham sonuçlarını gösterir
     private fun testRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
-        if (running) { toast("Önce döngüyü kapat"); return }
+        if (running) { toast("Önce döngüyü durdur"); return }
         withScreenshot { bmp ->
             if (bmp == null) { toast("Ekran alınamadı"); return@withScreenshot }
             for (v in 0..2) {
@@ -485,6 +745,7 @@ class StartService : AccessibilityService() {
         session++
         resetState()
         updateMainColor()
+        setKeepAwake(false)
     }
 
     private fun stopAll(msg: String) {
@@ -495,12 +756,16 @@ class StartService : AccessibilityService() {
     private fun toggleLoop() {
         if (!running) {
             if (!slotReady(PLAY)) {
-                toast("Önce yuva 1'i (Maça gir) kalibre et"); return
+                toast("Önce yuva 1'i (Maça gir) kaydet"); return
             }
             session++
             resetState()
             needCheck = true            // ilk Oyna'dan önce kupayı oku
             running = true
+            val now = System.currentTimeMillis()
+            lastProgressMs = now
+            pkgSince = now
+            setKeepAwake(true)
             ui.post(scanTick)
             ui.post(combatTick)
             val missing = (1..SlotStore.CORE).filter { !slotReady(it) }
@@ -514,20 +779,31 @@ class StartService : AccessibilityService() {
     }
 
     private fun updateMainColor() {
-        val bg = mainBtn?.background as? GradientDrawable ?: return
-        bg.setColor(Color.parseColor(if (running) "#43A047" else "#E53935"))
+        val m = mainItem ?: return
+        m.iv.fill = Color.parseColor(if (running) "#43A047" else "#E53935")
+        m.iv.icon = if (running) Ic.STOP else Ic.PLAY
+        m.tv.text = if (running) "Durdur" else "Başlat"
     }
 
     // Maçtayken ekran görüntüsünü iki saldırı basışının ortasına denk getirir
     private val scanTick = object : Runnable {
         override fun run() {
             if (!running) return
-            val pkg = lastPkg
+            val now = System.currentTimeMillis()
+            var pkg = lastPkg
+            if (pkg != null && pkg != GAME_PKG && now - pkgSince > FOREIGN_PKG_MS) {
+                log("Başka uygulama ($pkg) ${FOREIGN_PKG_MS / 1000} sn görünüyor: oyunda sayılıyor")
+                lastPkg = null; pkg = null
+            }
+            if (now - lastProgressMs > STUCK_MS) {
+                log("TAKILDI? faz=$phase maçta=$inMatch pkg=$lastPkg ekranHata=$shotFails kontrolGerek=$needCheck")
+                lastProgressMs = now
+            }
             val gameFront = pkg == null || pkg == GAME_PKG
             if (gameFront && calibLayer == null) {
                 val s = session
                 val wait = if (inMatch) {
-                    val since = System.currentTimeMillis() - lastTapMs[ATTACK]
+                    val since = now - lastTapMs[ATTACK]
                     ((SHOT_OFFSET_MS - since) % COMBAT_PERIOD_MS + COMBAT_PERIOD_MS) % COMBAT_PERIOD_MS
                 } else 0L
                 ui.postDelayed({
@@ -572,23 +848,26 @@ class StartService : AccessibilityService() {
 
     private fun evaluate(bmp: Bitmap) {
         val now = System.currentTimeMillis()
-
-        // Menü düğmeleri (Maça gir, Devam, Devam, Çıkış) maç sırasında da izlenir:
-        // biri üst üste 2 taramada görünürse maç bitmiştir, saldırı hemen kesilir.
-        for (i in MENU_SLOTS) streak[i] = if (hit(i, bmp)) streak[i] + 1 else 0
-        val endSeen = MENU_SLOTS.any { streak[it] >= CONFIRM_SCANS }
-        if (endSeen) {
-            inMatch = false; hitStreak = 0; missStreak = 0; lastGateMs = now
-        } else {
-            updateGate(bmp, now)
-        }
-
-        if (inMatch) {
-            if (phase != Phase.LOOP) { phase = Phase.LOOP; needCheck = false; afterSwitch = false }
-            return
-        }
         when (phase) {
-            Phase.LOOP -> loopStep(now)
+            Phase.LOOP -> {
+                // Menü düğmeleri maç sırasında da izlenir: biri 2 taramada görünürse maç bitmiştir
+                for (i in MENU_SLOTS) streak[i] = if (hit(i, bmp)) streak[i] + 1 else 0
+                val endSeen = MENU_SLOTS.any { streak[it] >= CONFIRM_SCANS }
+                val was = inMatch
+                if (endSeen) {
+                    inMatch = false; hitStreak = 0; missStreak = 0; lastGateMs = now
+                } else {
+                    updateGate(bmp, now)
+                }
+                if (inMatch != was) {
+                    lastProgressMs = now
+                    log(if (inMatch) "Maç başladı" else "Maç bitti")
+                    if (inMatch) needCheck = true   // maçtan sonraki ilk Oyna'dan önce kupa okunacak
+                }
+                if (inMatch) return
+                loopStep(now)
+            }
+            // Okuma ve karakter değiştirme sırasında maç kapısı çalışmaz, faz sıfırlanmaz
             Phase.READING -> readStep(bmp, now)
             Phase.SWITCH -> switchStep(bmp, now)
         }
@@ -604,7 +883,7 @@ class StartService : AccessibilityService() {
                 return
             }
             tapSlot(i)
-            if (i == EXIT) needCheck = true
+            if (i != PLAY) needCheck = true   // 3, 4, 5'e basıldıysa sonraki Oyna'dan önce oku
             return                      // bir taramada en fazla bir dokunuş
         }
     }
@@ -618,6 +897,7 @@ class StartService : AccessibilityService() {
         ocrBusy = false
         readStartMs = at
         settleUntil = at
+        log("Kupa okuması başladı")
     }
 
     private fun readStep(bmp: Bitmap, now: Long) {
@@ -643,6 +923,7 @@ class StartService : AccessibilityService() {
         readAttempts++
         toast("Okuma $readAttempts: '${clean(raw)}' → ${v ?: "?"}")
         if (v != null) reads.add(v)
+        // Aynı değer REQUIRED_VOTES kez gelmeden karar verilmez
         val winner = reads.groupingBy { it }.eachCount()
             .filter { it.value >= REQUIRED_VOTES }.keys.maxOrNull()
         when {
@@ -686,7 +967,8 @@ class StartService : AccessibilityService() {
     private fun switchLive(s: Int, tok: Int) =
         running && s == session && tok == switchToken && phase == Phase.SWITCH
 
-    // 6 renk görününce basılır. 7 ve 8 renge BAKMADAN 10 sn arayla basılır.
+    // 6 renk görününce basılır. 7 ve 8 renge BAKMADAN 5 sn arayla basılır.
+    // Bu süre boyunca okuma yapılmaz; 8'e basılınca okuma başlar.
     private fun switchStep(bmp: Bitmap, now: Long) {
         if (switchArmed) return
         if (now - stepStartMs > STEP_TIMEOUT_MS) {
@@ -807,15 +1089,22 @@ class StartService : AccessibilityService() {
                         result.hardwareBuffer.close()
                         shotBusy = false
                     }
+                    shotFails = 0
                     try { done(bmp) } finally { bmp?.recycle() }
                 }
 
                 override fun onFailure(errorCode: Int) {
                     shotBusy = false
+                    shotFails++
+                    if (shotFails == 3 || shotFails % 30 == 0)
+                        log("Ekran görüntüsü hatası kod=$errorCode (üst üste $shotFails)")
                     done(null)
                 }
             })
     }
 
-    private fun toast(s: String) = ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+    private fun toast(s: String) {
+        log(s)
+        ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+    }
 }
