@@ -49,6 +49,8 @@ class StartService : AccessibilityService() {
     private var calibLayer: View? = null
     private var markers: MarkerView? = null
     private var markersOn = true
+    private var readLabel: String? = null
+    private var labelToken = 0
 
     private var running = false
     private var shotBusy = false
@@ -100,7 +102,7 @@ class StartService : AccessibilityService() {
 
         const val SCAN_PERIOD_MS = 1100L     // takeScreenshot sık çağrılınca reddeder
         const val COMBAT_PERIOD_MS = 500L    // saniyede 2
-        const val SHOT_OFFSET_MS = 220L      // ekran görüntüsü, son basıştan bu kadar sonra (kalibre edilmedi)
+        const val SHOT_OFFSET_MS = 220L      // kalibre edilmedi
         const val GATE_FRESH_MS = 3000L
         const val ENTER_HITS = 2
         const val EXIT_MISSES = 2
@@ -108,6 +110,7 @@ class StartService : AccessibilityService() {
         const val CONFIRM_SCANS = 2
         const val COLOR_TOLERANCE = 35       // kalibre edilmedi
         const val SAMPLE_RADIUS = 3
+        const val LABEL_MS = 3000L
 
         const val OCR_TARGET_H = 128
         const val MAX_READ_ATTEMPTS = 9
@@ -190,7 +193,8 @@ class StartService : AccessibilityService() {
                 ring.color = Color.WHITE
                 txt.color = Color.WHITE
                 c.drawRect(l, t, rr, bb, ring)
-                c.drawText("OKU", (l + rr) / 2f, t - dp(6), txt)
+                val lab = readLabel
+                c.drawText(if (lab == null) "OKU" else "OKU ($lab)", (l + rr) / 2f, t - dp(6), txt)
             }
         }
     }
@@ -219,6 +223,19 @@ class StartService : AccessibilityService() {
         toast(if (markersOn) "Halkalar gösteriliyor" else "Halkalar gizli")
     }
 
+    // OKU çerçevesindeki yazıyı 3 sn "OKU (x)" yapar, sonra "OKU"ya döndürür
+    private fun showLabel(t: String) {
+        ui.post {
+            readLabel = t
+            val tok = ++labelToken
+            markers?.invalidate()
+            if (!markersOn) toast("OKU ($t)")
+            ui.postDelayed({
+                if (tok == labelToken) { readLabel = null; markers?.invalidate() }
+            }, LABEL_MS)
+        }
+    }
+
     // --- Panel ---
 
     private fun circle(color: Int, sizeDp: Int): View = View(this).apply {
@@ -239,14 +256,15 @@ class StartService : AccessibilityService() {
         val calib = circle(Color.parseColor("#1E88E5"), 26)    // kalibrasyon; uzun = hepsini sil
         val hide = circle(Color.parseColor("#9E9E9E"), 26)     // halkaları gizle/göster
         val copy = circle(Color.parseColor("#8E24AA"), 26)     // panoya kopyala
-        val area = circle(Color.parseColor("#00ACC1"), 26)     // kupa alanı seç; uzun = test oku
+        val area = circle(Color.parseColor("#00ACC1"), 26)     // kupa alanı seç; uzun = detaylı test
+        val live = circle(Color.parseColor("#FDD835"), 26)     // okumayı dene: OKU (sayı)
         val off = circle(Color.BLACK, 26)                      // servisi tamamen kapat
         mainBtn = main
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(handle); addView(main); addView(calib)
-            addView(hide); addView(copy); addView(area); addView(off)
+            addView(hide); addView(copy); addView(area); addView(live); addView(off)
         }
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -257,7 +275,7 @@ class StartService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(16); y = dp(60)
+            x = dp(16); y = dp(40)
         }
         panel = box
 
@@ -289,6 +307,7 @@ class StartService : AccessibilityService() {
         copy.setOnClickListener { copySlots() }
         area.setOnClickListener { selectRect() }
         area.setOnLongClickListener { testRead(); true }
+        live.setOnClickListener { liveRead() }
         off.setOnClickListener { shutdown() }
 
         wm.addView(box, lp)
@@ -399,14 +418,41 @@ class StartService : AccessibilityService() {
                         prefs.edit().putFloat("ox1", l).putFloat("oy1", t)
                             .putFloat("ox2", r).putFloat("oy2", bt).apply()
                         refreshMarkers()
-                        toast("Okuma alanı kaydedildi. Uzun basarak test oku.")
+                        toast("Okuma alanı kaydedildi. Sarı butonla test et.")
                     }
                 }
             }, 300)
         }
     }
 
-    // Turkuaz butona uzun basış: alanı 3 farklı görüntü işlemeyle bir kere okur
+    // Sarı buton: alanı 3 farklı görüntü işlemeyle okur, çerçevede OKU (sayı) / OKU (Yok) gösterir
+    private fun liveRead() {
+        if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
+        if (running) { toast("Önce döngüyü kapat"); return }
+        withScreenshot { bmp ->
+            if (bmp == null) { showLabel("Yok"); return@withScreenshot }
+            val crops = (0..2).map { cropForOcr(bmp, it) }
+            if (crops.any { it == null }) {
+                crops.forEach { it?.recycle() }
+                showLabel("Yok"); return@withScreenshot
+            }
+            val vals = arrayOfNulls<Int>(3)
+            var left = 3
+            for (idx in 0..2) {
+                recognize(crops[idx]!!) { raw ->
+                    vals[idx] = TrophyParser.parse(raw)
+                    left--
+                    if (left == 0) {
+                        val found = vals.filterNotNull()
+                        val best = found.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
+                        showLabel(best?.toString() ?: "Yok")
+                    }
+                }
+            }
+        }
+    }
+
+    // Turkuaz butona uzun basış: 3 görüntü işlemenin ham sonuçlarını gösterir
     private fun testRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
         if (running) { toast("Önce döngüyü kapat"); return }
@@ -472,8 +518,7 @@ class StartService : AccessibilityService() {
         bg.setColor(Color.parseColor(if (running) "#43A047" else "#E53935"))
     }
 
-    // Maçtayken ekran görüntüsünü iki saldırı basışının tam ortasına denk getirir,
-    // böylece basış hiç durmaz ve düğme "basılı" renkte okunmaz.
+    // Maçtayken ekran görüntüsünü iki saldırı basışının ortasına denk getirir
     private val scanTick = object : Runnable {
         override fun run() {
             if (!running) return
@@ -527,22 +572,30 @@ class StartService : AccessibilityService() {
 
     private fun evaluate(bmp: Bitmap) {
         val now = System.currentTimeMillis()
-        updateGate(bmp, now)
+
+        // Menü düğmeleri (Maça gir, Devam, Devam, Çıkış) maç sırasında da izlenir:
+        // biri üst üste 2 taramada görünürse maç bitmiştir, saldırı hemen kesilir.
+        for (i in MENU_SLOTS) streak[i] = if (hit(i, bmp)) streak[i] + 1 else 0
+        val endSeen = MENU_SLOTS.any { streak[it] >= CONFIRM_SCANS }
+        if (endSeen) {
+            inMatch = false; hitStreak = 0; missStreak = 0; lastGateMs = now
+        } else {
+            updateGate(bmp, now)
+        }
+
         if (inMatch) {
-            streak.fill(0)
             if (phase != Phase.LOOP) { phase = Phase.LOOP; needCheck = false; afterSwitch = false }
             return
         }
         when (phase) {
-            Phase.LOOP -> loopStep(bmp, now)
+            Phase.LOOP -> loopStep(now)
             Phase.READING -> readStep(bmp, now)
             Phase.SWITCH -> switchStep(bmp, now)
         }
     }
 
     // Maç dışı: Maça gir, Devam, Devam, Çıkış
-    private fun loopStep(bmp: Bitmap, now: Long) {
-        for (i in MENU_SLOTS) streak[i] = if (hit(i, bmp)) streak[i] + 1 else 0
+    private fun loopStep(now: Long) {
         for (i in MENU_SLOTS) {
             if (streak[i] < CONFIRM_SCANS || now - lastTapMs[i] < SLOT_COOLDOWN_MS) continue
             streak.fill(0)
@@ -590,7 +643,6 @@ class StartService : AccessibilityService() {
         readAttempts++
         toast("Okuma $readAttempts: '${clean(raw)}' → ${v ?: "?"}")
         if (v != null) reads.add(v)
-        // Aynı değer 2 kez gelince karar. İki değer de 2 oya ulaşırsa büyüğü seçilir.
         val winner = reads.groupingBy { it }.eachCount()
             .filter { it.value >= REQUIRED_VOTES }.keys.maxOrNull()
         when {
