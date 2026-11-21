@@ -12,6 +12,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.util.Locale
 
 class MainActivity : Activity() {
@@ -24,16 +25,19 @@ class MainActivity : Activity() {
 
     private fun guideHtml(): String =
         "<b>PANEL BUTONLARI (yukarıdan aşağı)</b><br>" +
-        "${dot("#FF9800")} <b>Turuncu:</b> sürükle. Kısa dokunma sıradaki yuvaya atlar.<br>" +
-        "${dot("#E53935")} <b>Kırmızı (büyük):</b> döngüyü aç/kapat. Yeşil = çalışıyor.<br>" +
-        "${dot("#1E88E5")} <b>Mavi:</b> kalibrasyon, sıradaki yuvayı kaydeder. Uzun bas = her şeyi sil.<br>" +
-        "${dot("#9E9E9E")} <b>Gri:</b> halkaları ve OKU çerçevesini gizle/göster.<br>" +
-        "${dot("#8E24AA")} <b>Mor:</b> yuvaları panoya kopyala.<br>" +
-        "${dot("#00ACC1")} <b>Turkuaz:</b> kupa alanını seç (sol üst, sonra sağ alt). Uzun bas = detaylı test.<br>" +
-        "${dot("#FDD835")} <b>Sarı:</b> okumayı dene. Çerçevede OKU (sayı) veya OKU (Yok) yazar, 3 sn sonra OKU olur.<br>" +
-        "${dot("#000000")} <b>Siyah:</b> servisi tamamen kapat.<br><br>" +
+        "${dot("#FF9800")} <b>Taşı</b> (dört yönlü ok): sürükle. Kısa dokunma sıradaki yuvaya atlar.<br>" +
+        "${dot("#E53935")} <b>Başlat / Durdur</b> (▶ / ■): döngü. Yeşil = çalışıyor.<br>" +
+        "${dot("#1E88E5")} <b>Yuva kaydet</b> (+): sıradaki yuvanın düğmesine dokunursun, konum ve renk kaydedilir.<br>" +
+        "${dot("#B71C1C")} <b>Hepsini sil</b> (−): her şeyi onaysız siler. Yanlışsa Geri al.<br>" +
+        "${dot("#607D8B")} <b>Geri al</b>: + / − / Alan seç işlemlerinin sonuncusunu geri alır (tek seviye).<br>" +
+        "${dot("#9E9E9E")} <b>Halkalar</b> (göz): halkaları ve OKU çerçevesini gizle/göster.<br>" +
+        "${dot("#8E24AA")} <b>Kopyala</b> (pano): yuvaları panoya kopyalar.<br>" +
+        "${dot("#00ACC1")} <b>Alan seç</b> (ekran): kupa alanı, sol üst sonra sağ alt köşe. Uzun bas = detaylı test. " +
+        "Seçim sırasında panelde herhangi bir butona basarsan iptal olur.<br>" +
+        "${dot("#FDD835")} <b>Test oku</b> (?): çerçevede OKU (sayı) veya OKU (Yok) yazar.<br>" +
+        "${dot("#000000")} <b>Gizle</b> (kırmızı X): döngüyü durdurur, paneli gizler. Geri açmak için uygulamadaki düğme.<br><br>" +
 
-        "<b>HALKA RENKLERİ (ekrandaki numaralar)</b><br>" +
+        "<b>HALKA RENKLERİ</b><br>" +
         "${dot("#43A047")} 1 Maça gir &nbsp; ${dot("#E53935")} 2 Saldırı &nbsp; ${dot("#1E88E5")} 3 Devam<br>" +
         "${dot("#8E24AA")} 4 Devam &nbsp; ${dot("#FB8C00")} 5 Bitir &nbsp; ${dot("#00ACC1")} 6 Savaşçılar<br>" +
         "${dot("#F06292")} 7 Karakter seç &nbsp; ${dot("#A1887F")} 8 Seç<br>" +
@@ -41,10 +45,10 @@ class MainActivity : Activity() {
 
         "<b>KURULUM SIRASI (oyun içinde)</b><br>" +
         "1. Erişilebilirlik ayarlarından BS Start'ı aç.<br>" +
-        "2. Mavi butona <b>uzun bas</b>: eski kayıtlar silinir.<br>" +
-        "3. Lobide turkuaz butona bas: kupa sayısının <b>sol üst</b>, sonra <b>sağ alt</b> köşesine dokun.<br>" +
-        "4. Sarı butona bas, OKU (sayı) doğru mu bak.<br>" +
-        "5. Mavi butona bas, sırayla her seferinde düğmeye dokun:<br>" +
+        "2. Koyu kırmızı − ile eski kayıtları sil.<br>" +
+        "3. Lobide Alan seç: kupa sayısının <b>sol üst</b>, sonra <b>sağ alt</b> köşesi.<br>" +
+        "4. Test oku (?): OKU (sayı) doğru mu bak.<br>" +
+        "5. Mavi + ile sırayla her seferinde düğmeye dokun:<br>" +
         "&nbsp;&nbsp;<b>1</b> Maça gir (lobide)<br>" +
         "&nbsp;&nbsp;<b>2</b> Saldırı (maç içinde)<br>" +
         "&nbsp;&nbsp;<b>3</b> Devam (maç sonu)<br>" +
@@ -53,14 +57,36 @@ class MainActivity : Activity() {
         "&nbsp;&nbsp;<b>6</b> Savaşçılar (karakter ekranına gir)<br>" +
         "&nbsp;&nbsp;<b>7</b> Karakter seç (listedeki kart)<br>" +
         "&nbsp;&nbsp;<b>8</b> Seç (ana ekrana atar)<br>" +
-        "6. İstersen mor butonla kopyala, aşağıya yapıştırıp OK'e bas (yedek).<br>" +
-        "7. Gri butonla halkaları gizle, paneli kupa alanından uzağa sürükle.<br>" +
-        "8. Kırmızıya bas, yeşil olunca bırak. Durdurmak için siyah.<br><br>" +
+        "6. Göz ile halkaları gizle, paneli kupa alanından uzağa taşı.<br>" +
+        "7. Başlat'a bas, yeşil ■ olunca bırak. Durdurmak için ■ veya Gizle.<br><br>" +
 
         "<b>DÖNGÜ SIRASI</b><br>" +
         "Kupayı oku. 950'den azsa: 1 → 2 → 3 → 4 → 5, başa dön. " +
-        "950 veya fazlaysa: 6 → (10 sn) 7 → (10 sn) 8, kupayı tekrar oku. " +
+        "950 veya fazlaysa: 6 → (5 sn) 7 → (5 sn) 8, kupayı tekrar oku. " +
         "950'den azsa döngüye devam, hâlâ 950 veya fazlaysa dur.<br><br>"
+
+    private lateinit var status: TextView
+    private lateinit var logView: TextView
+
+    private fun refreshStatus() {
+        val s = ServiceBridge.service
+        status.text = when {
+            s == null -> "Servis kapalı: Erişilebilirlik ayarlarından BS Start'ı aç."
+            s.isPanelVisible() -> "Panel görünüyor."
+            else -> "Panel gizli."
+        }
+    }
+
+    private fun refreshLog() {
+        val raw = getSharedPreferences("bslog", MODE_PRIVATE).getString("l", "") ?: ""
+        logView.text = if (raw.isEmpty()) "(kayıt yok)" else raw.lines().reversed().joinToString("\n")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshStatus()
+        refreshLog()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,22 +95,55 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
-        col.addView(TextView(this).apply {
-            text = Html.fromHtml(guideHtml(), Html.FROM_HTML_MODE_LEGACY)
-            textSize = 15f
-        })
-        col.addView(TextView(this).apply {
-            text = "Android 13+ ve APK'yı dışarıdan yüklediysen izin gri olabilir: " +
-                "Ayarlar > Uygulamalar > BS Start > sağ üst ⋮ > Kısıtlanmış ayarlara izin ver."
+
+        status = TextView(this).apply { textSize = 16f }
+        col.addView(status)
+        col.addView(Button(this).apply {
+            text = "Paneli göster / gizle"
+            setOnClickListener {
+                val s = ServiceBridge.service
+                if (s == null) {
+                    Toast.makeText(this@MainActivity, "Servis kapalı, önce erişilebilirliği aç", Toast.LENGTH_SHORT).show()
+                } else {
+                    s.setPanelVisible(!s.isPanelVisible())
+                }
+                refreshStatus()
+            }
         })
         col.addView(Button(this).apply {
             text = "Erişilebilirlik ayarlarını aç"
             setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         })
+        col.addView(TextView(this).apply {
+            text = "Android 13+ ve APK'yı dışarıdan yüklediysen izin gri olabilir: " +
+                "Ayarlar > Uygulamalar > BS Start > sağ üst ⋮ > Kısıtlanmış ayarlara izin ver.\n"
+        })
+
+        col.addView(TextView(this).apply {
+            text = Html.fromHtml(guideHtml(), Html.FROM_HTML_MODE_LEGACY)
+            textSize = 15f
+        })
+
+        col.addView(TextView(this).apply { text = "KAYIT DEFTERİ (en yeni üstte)"; textSize = 15f })
+        logView = TextView(this).apply { textSize = 12f; setTextIsSelectable(true) }
+        col.addView(Button(this).apply {
+            text = "Kayıtları yenile"
+            setOnClickListener { refreshLog() }
+        })
+        col.addView(Button(this).apply {
+            text = "Kayıtları sil"
+            setOnClickListener {
+                getSharedPreferences("bslog", MODE_PRIVATE).edit().clear().apply()
+                refreshLog()
+            }
+        })
+        col.addView(logView)
+
+        col.addView(TextView(this).apply { text = "\nYUVA YEDEĞİ"; textSize = 15f })
         val input = EditText(this).apply {
             hint = "Kopyalanan yuva metnini buraya yapıştır"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            minLines = 8
+            minLines = 6
             gravity = Gravity.TOP or Gravity.START
         }
         val out = TextView(this)
