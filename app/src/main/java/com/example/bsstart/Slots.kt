@@ -6,6 +6,8 @@ import java.util.Locale
 object SlotStore {
     const val PREFS = "cfg3"
     const val SET = "bsset"
+    const val REC = "bsrec"
+    const val BACKUP = "bsbackup"
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
     const val MAX_LIMIT = 3000
@@ -28,8 +30,23 @@ object SlotStore {
     fun totReady(p: SharedPreferences) =
         listOf("tx1", "ty1", "tx2", "ty2").all { p.contains(it) }
 
-    // Çekirdek 5 yuva dolu değilse null. Dolu olan 6-8, OCR ve TOT alanları eklenir.
-    fun format(p: SharedPreferences, screen: String): String? {
+    // Haritadaki her kaydı editöre kopyalar
+    fun copyInto(m: Map<String, *>, e: SharedPreferences.Editor, skip: String? = null) {
+        for ((k, v) in m) {
+            if (k == skip) continue
+            when (v) {
+                is Float -> e.putFloat(k, v)
+                is Int -> e.putInt(k, v)
+                is Long -> e.putLong(k, v)
+                is Boolean -> e.putBoolean(k, v)
+                is String -> e.putString(k, v)
+                else -> {}
+            }
+        }
+    }
+
+    // Çekirdek 5 yuva dolu değilse null. Dolu olan 6-8, OCR, TOT alanları ve (verilirse) ayarlar eklenir.
+    fun format(p: SharedPreferences, screen: String, sets: SharedPreferences? = null): String? {
         if (!coreReady(p)) return null
         val sb = StringBuilder("$HEADER screen=$screen\n")
         for (i in 1..SLOTS) {
@@ -60,13 +77,23 @@ object SlotStore {
                 )
             )
         }
+        if (sets != null) {
+            sb.append(
+                String.format(
+                    Locale.US, "SET limit=%d scale=%.2f tot=%d\n",
+                    sets.getInt("limit", DEFAULT_LIMIT).coerceIn(MIN_LIMIT, MAX_LIMIT),
+                    sets.getFloat("scale", 1f).coerceIn(0.5f, 2f),
+                    if (sets.getBoolean("ttot", false)) 1 else 0
+                )
+            )
+        }
         return sb.toString()
     }
 
     class Parsed(
         val xs: FloatArray, val ys: FloatArray, val colors: IntArray,
         val have: BooleanArray, val rect: FloatArray?, val tot: FloatArray?,
-        val screen: String
+        val set: Triple<Int, Float, Boolean>?, val screen: String
     )
 
     class ParseResult(val parsed: Parsed?, val error: String?)
@@ -77,6 +104,8 @@ object SlotStore {
         Regex("""^OCR\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
     private val TOT_RE =
         Regex("""^TOT\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
+    private val SET_RE =
+        Regex("""^SET\s+limit=(\d+)\s+scale=([0-9.]+)\s+tot=([01])$""")
 
     private fun err(m: String) = ParseResult(null, m)
 
@@ -86,8 +115,26 @@ object SlotStore {
         return v
     }
 
+    // Birden çok kayıt yapıştırılmışsa başlık satırlarından böler; "===" satırları yok sayılır
+    fun splitBlocks(text: String): List<String> {
+        val out = ArrayList<String>()
+        var cur: StringBuilder? = null
+        for (raw in text.replace("\r", "").lines()) {
+            val l = raw.trim()
+            if (l.startsWith("===")) continue
+            if (l.startsWith(HEADER)) {
+                cur?.let { out.add(it.toString()) }
+                cur = StringBuilder()
+            }
+            cur?.append(l)?.append('\n')
+        }
+        cur?.let { out.add(it.toString()) }
+        return out
+    }
+
     fun parse(text: String): ParseResult {
-        val lines = text.replace("\r", "").lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val lines = text.replace("\r", "").lines().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("===") }
         if (lines.isEmpty() || !lines[0].startsWith(HEADER))
             return err("İlk satır '$HEADER' ile başlamalı (eski v1 metni geçmez)")
         val screen = Regex("screen=(\\S+)").find(lines[0])?.groupValues?.get(1) ?: "?"
@@ -96,6 +143,7 @@ object SlotStore {
         val cs = IntArray(SLOTS + 1); val have = BooleanArray(SLOTS + 1)
         var rect: FloatArray? = null
         var tot: FloatArray? = null
+        var set: Triple<Int, Float, Boolean>? = null
 
         for (line in lines.drop(1)) {
             val m = SLOT_RE.find(line)
@@ -124,14 +172,24 @@ object SlotStore {
                 tot = rectOf(t) ?: return err("TOT alanı geçersiz: $line")
                 continue
             }
+            val s = SET_RE.find(line)
+            if (s != null) {
+                if (set != null) return err("SET satırı iki kere var")
+                val lim = s.groupValues[1].toIntOrNull()
+                val sc = s.groupValues[2].toFloatOrNull()
+                if (lim == null || lim !in MIN_LIMIT..MAX_LIMIT) return err("Kupa sınırı geçersiz: $line")
+                if (sc == null || sc < 0.5f || sc > 2f) return err("Panel boyutu 0.5-2 olmalı: $line")
+                set = Triple(lim, sc, s.groupValues[3] == "1")
+                continue
+            }
             return err("Tanınmayan satır: $line")
         }
         val missing = (1..CORE).filter { !have[it] }
         if (missing.isNotEmpty()) return err("Eksik yuvalar: $missing")
-        return ParseResult(Parsed(xs, ys, cs, have, rect, tot, screen), null)
+        return ParseResult(Parsed(xs, ys, cs, have, rect, tot, set, screen), null)
     }
 
-    fun apply(p: SharedPreferences, d: Parsed): Boolean {
+    fun apply(p: SharedPreferences, d: Parsed, sets: SharedPreferences? = null): Boolean {
         val e = p.edit().clear()
         for (i in 1..SLOTS) {
             if (!d.have[i]) continue
@@ -146,7 +204,34 @@ object SlotStore {
                 .putFloat("tx2", it[2]).putFloat("ty2", it[3])
         }
         e.putString("screen", d.screen)
-        return e.commit()
+        var ok = e.commit()
+        val st = d.set
+        if (st != null && sets != null) {
+            ok = sets.edit().putInt("limit", st.first).putFloat("scale", st.second)
+                .putBoolean("ttot", st.third).commit() && ok
+        }
+        return ok
+    }
+
+    // --- Kayıtlar (Kayıt 1, Kayıt 2, ...) ---
+
+    fun recList(r: SharedPreferences): List<Pair<Int, String>> =
+        r.all.entries.mapNotNull { e ->
+            val k = e.key
+            val s = e.value as? String
+            if (s != null && k.length > 1 && k[0] == 'r' && k.substring(1).all { it.isDigit() })
+                (k.substring(1).toIntOrNull() ?: return@mapNotNull null) to s
+            else null
+        }.sortedBy { it.first }
+
+    fun recAdd(r: SharedPreferences, text: String): Int {
+        val n = r.getInt("next", 1)
+        r.edit().putString("r$n", text).putInt("next", n + 1).commit()
+        return n
+    }
+
+    fun recDelete(r: SharedPreferences, n: Int) {
+        r.edit().remove("r$n").commit()
     }
 }
 
