@@ -63,6 +63,7 @@ class StartService : AccessibilityService() {
                 when {
                     key == "scale" -> rebuildPanel()
                     key == "ttot" -> { ensureScan(); updateTotUi() }
+                    key == "atrophy" -> if (!trophyCheckOn()) abortTrophy()
                     key != null && key.startsWith("btn_") -> applyVisibility()
                 }
             }
@@ -74,6 +75,27 @@ class StartService : AccessibilityService() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun d(v: Int) = max(1, (v * resources.displayMetrics.density * scale()).toInt())
     private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
+
+    // Otomatik kupa: uygulamadaki anahtar açık VE okuma alanı kayıtlı
+    private fun trophyCheckOn() = SlotStore.autoTrophy(sets, prefs) && SlotStore.rectReady(prefs)
+
+    // Anahtar döngü sırasında kapatılırsa süren okuma/karakter değiştirme bırakılır
+    private fun abortTrophy() {
+        phase = Phase.LOOP
+        ocrBusy = false; switchArmed = false; afterSwitch = false
+        switchToken++
+        needCheck = false
+        reads.clear()
+    }
+
+    // Son 12 okuma satırı, uygulamadaki "Son okumalar" bölümünde görünür
+    private fun logRead(m: String) {
+        try {
+            val old = stat.getString("reads", "") ?: ""
+            val lines = (old.split("\n").filter { it.isNotEmpty() } + "${stamp()} $m").takeLast(12)
+            stat.edit().putString("reads", lines.joinToString("\n")).apply()
+        } catch (_: Exception) {}
+    }
 
     private var panel: View? = null
     private var panelLp: WindowManager.LayoutParams? = null
@@ -126,7 +148,8 @@ class StartService : AccessibilityService() {
     private var phase = Phase.LOOP
     private var needCheck = false
     private var afterSwitch = false
-    private var trophyUpper: Int? = null
+    private var trophyUpper: Int? = null    // son okunan kupa + maç başına en fazla 10
+    private var trophyLow: Int? = null      // son okunan kupa - maç başına en fazla 5
     private var stepStartMs = 0L
     private var switchArmed = false
     private var switchToken = 0
@@ -183,6 +206,9 @@ class StartService : AccessibilityService() {
         const val VARIANTS = 6
         const val MAX_READ_ATTEMPTS = 12
         const val REQUIRED_VOTES = 3
+        const val SWITCH_VOTES = 4          // karakter değiştirmek için gereken oy
+        const val SUSPECT_SLACK = 10        // olası kupa aralığının dışında kabul edilen pay
+        const val MATCH_DROP = 5            // maç başına en fazla kupa kaybı (tabloya göre)
         const val MAX_FAIL_CYCLES = 20
         const val READ_TIMEOUT_MS = 30000L
         const val STEP_TIMEOUT_MS = 12000L
@@ -1304,6 +1330,7 @@ class StartService : AccessibilityService() {
         phase = Phase.LOOP; needCheck = false; afterSwitch = false
         ocrBusy = false; switchArmed = false; failCycles = 0
         trophyUpper = null
+        trophyLow = null
         reads.clear()
     }
 
@@ -1343,8 +1370,13 @@ class StartService : AccessibilityService() {
             ensureScan()
             if (!combatRunning) { combatRunning = true; nextTapAt = 0L; ui.post(combatTick) }
             note("Döngü başlatıldı")
+            logRead("başlatıldı: sınır ${limit()}, otomatik kupa ${if (trophyCheckOn()) "açık" else "kapalı"}")
             val missing = SlotStore.REQUIRED.filter { !slotReady(it) }
-            val ocr = if (SlotStore.rectReady(prefs)) "kupa kontrolü AÇIK (sınır ${limit()})" else "kupa alanı yok, kontrol kapalı"
+            val ocr = when {
+                trophyCheckOn() -> "kupa kontrolü AÇIK (sınır ${limit()})"
+                !SlotStore.autoTrophy(sets, prefs) -> "otomatik kupa KAPALI"
+                else -> "kupa alanı yok, kontrol kapalı"
+            }
             val ifc = (1..8).count { slotReady(IF_BASE + it) }
             val ifs = if (ifc > 0) ", $ifc if" else ""
             toast(if (missing.isEmpty()) "Döngü açık, $ocr$ifs" else "Döngü açık, eksik yuvalar: $missing")
@@ -1413,9 +1445,11 @@ class StartService : AccessibilityService() {
             hc[2] >= hr[2] * 0.55f && hc[2] <= hr[2] * 1.35f + 0.05f
     }
 
+    // Her maç başında olası kupa aralığı genişler: en fazla +10, en fazla -5
     private fun onMatchStart() {
         needCheck = true
         trophyUpper = trophyUpper?.plus(10)
+        trophyLow = trophyLow?.let { max(0, it - MATCH_DROP) }
         note("Maç başladı")
     }
 
@@ -1475,7 +1509,7 @@ class StartService : AccessibilityService() {
         for (i in MENU_SLOTS) {
             if (streak[i] < CONFIRM_SCANS || now - lastTapMs[i] < SLOT_COOLDOWN_MS) continue
             streak.fill(0)
-            if (i == PLAY && needCheck && SlotStore.rectReady(prefs)) {
+            if (i == PLAY && needCheck && trophyCheckOn()) {
                 startReading(now)
                 return
             }
@@ -1519,9 +1553,9 @@ class StartService : AccessibilityService() {
         val v = TrophyParser.parse(raw)
         readAttempts++
         toast("Okuma $readAttempts: '${clean(raw)}' → ${v ?: "?"}")
+        logRead("okuma $readAttempts: '${clean(raw)}' → ${v ?: "?"}")
         if (v != null) reads.add(v)
-        val winner = reads.groupingBy { it }.eachCount()
-            .filter { it.value >= REQUIRED_VOTES }.keys.maxOrNull()
+        val winner = pickWinner()
         when {
             winner != null -> decide(winner)
             readAttempts >= MAX_READ_ATTEMPTS -> readFailed("Kupa okunamadı")
@@ -1546,9 +1580,52 @@ class StartService : AccessibilityService() {
         startReading(System.currentTimeMillis() + 1500)
     }
 
+    // En çok oy alan değer kazanır (beraberlikte okumaya devam). Sınırın altı 3 oyla kabul edilir;
+    // sınır ve üstü (karakter değiştirir) en az 4 oy ister ve sınır altı okumalar (en fazla 1 sapma) çelişmemeli.
+    private fun pickWinner(): Int? {
+        val lim = limit()
+        val counts = reads.groupingBy { it }.eachCount()
+        val ranked = counts.entries.sortedByDescending { it.value }
+        val top = ranked.firstOrNull() ?: return null
+        val second = ranked.getOrNull(1)?.value ?: 0
+        if (top.value < REQUIRED_VOTES || top.value <= second) return null
+        if (top.key < lim) return top.key
+        val low = counts.entries.filter { it.key < lim }.sumOf { it.value }
+        return if (top.value >= SWITCH_VOTES && low <= 1) top.key else null
+    }
+
+    // Bilinen kupadan maçlarla ulaşılamayacak bir okuma: yok sayılır, karakter değişmez.
+    private fun implausible(v: Int, lim: Int, up: Int, lo: Int) {
+        note("İmkânsız okuma $v (olası $lo..$up): yok sayıldı")
+        toast("Okuma $v olası aralığın ($lo..$up) dışında, yok sayıldı")
+        logRead("yok sayıldı: $v, olası $lo..$up, sınır $lim")
+        streak.fill(0)
+        if (up < lim) {
+            // Tahmin sınırın altında: karakter değişmez, oynamaya devam
+            phase = Phase.LOOP; needCheck = false; failCycles = 0
+            return
+        }
+        // Tahmin sınırı geçmiş olabilir ama okuma tutarsız: tekrar oku
+        failCycles++
+        if (failCycles >= MAX_FAIL_CYCLES) {
+            stopAll("Okuma tutarsız ($v, olası $lo..$up): sistem durdu"); return
+        }
+        startReading(System.currentTimeMillis() + 1500)
+    }
+
     private fun decide(v: Int) {
         val lim = limit()
+        val up = trophyUpper
+        val lo = trophyLow
+        logRead("karar: $v (sınır $lim, olası aralık ${lo ?: "-"}..${up ?: "-"})")
+        // Karakter değiştirdikten sonraki ilk okumada eski aralık geçersizdir
+        if (!afterSwitch && up != null && lo != null &&
+            (v > up + SUSPECT_SLACK || v < lo - SUSPECT_SLACK)) {
+            implausible(v, lim, up, lo)
+            return
+        }
         trophyUpper = v
+        trophyLow = v
         note("Kupa $v (sınır $lim)")
         toast("Kupa: $v (sınır $lim)")
         streak.fill(0)
