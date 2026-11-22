@@ -1,6 +1,8 @@
 package com.example.bsstart
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
@@ -19,42 +21,40 @@ import java.util.Locale
 class MainActivity : Activity() {
 
     private fun norm(s: String) =
-        s.replace("\r", "").lines().map { it.trim() }.filter { it.isNotEmpty() }
+        s.replace("\r", "").lines().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("===") }
             .joinToString("\n").lowercase(Locale.ROOT)
 
-    private fun dot(color: String) = "<font color='$color'>●</font>"
-
     private fun guideHtml(): String =
-        "<b>PANEL BUTONLARI (yukarıdan aşağı)</b><br>" +
-        "${dot("#FF9800")} <b>Taşı</b> (dört yönlü ok): sürükle. Kısa dokunma sıradaki yuvaya atlar.<br>" +
-        "${dot("#E53935")} <b>Başlat / Durdur</b> (▶ / ■): döngü. Yeşil = çalışıyor.<br>" +
-        "${dot("#1E88E5")} <b>Yuva kaydet</b> (+): sıradaki yuvanın düğmesine dokunursun, konum ve renk kaydedilir.<br>" +
-        "${dot("#B71C1C")} <b>Hepsini sil</b> (−): her şeyi onaysız siler. Yanlışsa Geri al.<br>" +
-        "${dot("#607D8B")} <b>Geri al</b>: + / − / alan seçimi işlemlerinin sonuncusunu geri alır (tek seviye).<br>" +
-        "${dot("#9E9E9E")} <b>Halkalar</b> (göz): halkaları ve çerçeveleri gizle/göster.<br>" +
-        "${dot("#8E24AA")} <b>Kopyala</b> (pano): yuvaları ve alanları panoya kopyalar.<br>" +
-        "${dot("#00ACC1")} <b>Alan seç</b> (ekran): karakter kupası alanı, sol üst sonra sağ alt köşe. Uzun bas = detaylı test. " +
+        "<b>PANEL DÜĞMELERİ (yukarıdan aşağı)</b><br>" +
+        "• <b>Taşı</b> (dört yönlü ok): sürükle. Kısa dokunma sıradaki yuvaya atlar.<br>" +
+        "• <b>Başlat / Durdur</b>: döngü.<br>" +
+        "• <b>Yuva kaydet</b> (+): sıradaki yuvanın düğmesine dokunursun, konum ve renk kaydedilir.<br>" +
+        "• <b>Hepsini sil</b> (−): her şeyi onaysız siler. Yanlışsa Geri al.<br>" +
+        "• <b>Geri al</b>: + / − / alan seçimi işlemlerinin sonuncusunu geri alır (tek seviye).<br>" +
+        "• <b>Halkalar</b> (göz): halkaları ve çerçeveleri gizle/göster. Toplam kupa yazısı hep görünür.<br>" +
+        "• <b>Kopyala</b> (pano): yuvaları, alanları ve ayarları panoya kopyalar.<br>" +
+        "• <b>Alan seç</b> (ekran): karakter kupası alanı, sol üst sonra sağ alt köşe. Uzun bas = detaylı test. " +
         "Seçim sırasında panelde herhangi bir butona basarsan iptal olur.<br>" +
-        "${dot("#FDD835")} <b>Test oku</b> (?): çerçevede OKU (sayı) veya OKU (Yok) yazar.<br>" +
-        "${dot("#FFB300")} <b>Toplam</b> (kupa): ilk basış toplam kupa alanını seçtirir (sol üst, sağ alt). " +
+        "• <b>Test oku</b> (?): çerçevede OKU (sayı) veya OKU (Yok) yazar.<br>" +
+        "• <b>Toplam</b> (kupa): ilk basış toplam kupa alanını seçtirir (sol üst, sağ alt). " +
         "Sonraki basışlar takibi açar/kapatır, uzun basış alanı yeniden seçtirir. " +
-        "Açıkken ekranın üstünde [başlangıç → şimdi (+fark)] görünür.<br>" +
-        "${dot("#000000")} <b>Gizle</b> (kırmızı X): döngüyü durdurur, paneli gizler. Geri açmak için uygulamadaki düğme. " +
+        "Çerçevenin altında iki satır çıkar: güncel sayı (+fark) ve ilk okunan → güncel.<br>" +
+        "• <b>Kaydet</b>: mevcut her şeyi aşağıdaki Kayıtlar bölümüne Kayıt 1, Kayıt 2... diye ekler.<br>" +
+        "• <b>Gizle</b> (X): döngüyü durdurur, paneli gizler. Geri açmak için uygulamadaki düğme. " +
         "Tekrar açınca toplam kupa farkı (+0)'dan başlar.<br><br>" +
 
-        "<b>HALKA RENKLERİ</b><br>" +
-        "${dot("#43A047")} 1 Maça gir &nbsp; ${dot("#E53935")} 2 Saldırı &nbsp; ${dot("#1E88E5")} 3 Devam<br>" +
-        "${dot("#8E24AA")} 4 Devam &nbsp; ${dot("#FB8C00")} 5 Bitir &nbsp; ${dot("#00ACC1")} 6 Savaşçılar<br>" +
-        "${dot("#F06292")} 7 Karakter seç &nbsp; ${dot("#A1887F")} 8 Seç<br>" +
-        "Beyaz çerçeve = karakter kupası alanı, sarı çerçeve = toplam kupa alanı.<br><br>" +
+        "<b>SIFIRDAN YENİ PANEL</b><br>" +
+        "Uygulamadaki düğme paneli varsayılan yerde, o anki boyutta, boş yuvalarla açar. " +
+        "Eski yuvalar yedeğe alınır. Paneli Gizle deyip uygulamadan tekrar açarsan eski yuvalar geri gelir.<br><br>" +
 
         "<b>KURULUM SIRASI (oyun içinde)</b><br>" +
         "1. Erişilebilirlik ayarlarından BS Start'ı aç.<br>" +
-        "2. Koyu kırmızı − ile eski kayıtları sil.<br>" +
+        "2. Hepsini sil (−) ile eski kayıtları sil.<br>" +
         "3. Lobide Alan seç: karakter kupasının <b>sol üst</b>, sonra <b>sağ alt</b> köşesi.<br>" +
         "4. Test oku (?): OKU (sayı) doğru mu bak.<br>" +
         "5. İstersen Toplam: toplam kupa sayısının sol üst ve sağ alt köşesi.<br>" +
-        "6. Mavi + ile sırayla her seferinde düğmeye dokun:<br>" +
+        "6. Yuva kaydet (+) ile sırayla her seferinde düğmeye dokun:<br>" +
         "&nbsp;&nbsp;<b>1</b> Maça gir (lobide)<br>" +
         "&nbsp;&nbsp;<b>2</b> Saldırı (maç içinde)<br>" +
         "&nbsp;&nbsp;<b>3</b> Devam (maç sonu)<br>" +
@@ -63,16 +63,41 @@ class MainActivity : Activity() {
         "&nbsp;&nbsp;<b>6</b> Savaşçılar (karakter ekranına gir)<br>" +
         "&nbsp;&nbsp;<b>7</b> Karakter seç (listedeki kart)<br>" +
         "&nbsp;&nbsp;<b>8</b> Seç (ana ekrana atar)<br>" +
-        "7. Göz ile halkaları gizle, paneli kupa alanlarından uzağa taşı.<br>" +
-        "8. Başlat'a bas, yeşil ■ olunca bırak. Durdurmak için ■ veya Gizle.<br><br>" +
+        "7. Kaydet ile yedek al.<br>" +
+        "8. Göz ile halkaları gizle, paneli kupa alanlarından uzağa taşı.<br>" +
+        "9. Başlat'a bas. Durdurmak için Durdur veya Gizle.<br><br>" +
 
         "<b>DÖNGÜ SIRASI</b><br>" +
-        "Kupayı oku. Sınırın <b>altındaysa</b>: 1 → 2 (saniyede 5 vuruş) → 3 → 4 → 5, başa dön. " +
+        "Kupayı oku. Sınırın <b>altındaysa</b>: 1 → 2 (saniyede 5 vuruş, maç sonu düğmesi görünene kadar durmaz) → 3 → 4 → 5, başa dön. " +
         "Sınır <b>ve üstündeyse</b>: 6 → (5 sn) 7 → (5 sn) 8, kupayı tekrar oku. " +
         "Sınırın altındaysa döngüye devam, hâlâ sınır ve üstündeyse dur.<br><br>"
 
     private lateinit var status: TextView
     private lateinit var logView: TextView
+    private lateinit var recBox: LinearLayout
+    private lateinit var out: TextView
+
+    private fun say(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    private fun copyText(label: String, t: String) {
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(label, t))
+        say("Kopyalandı")
+    }
+
+    private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
+
+    private fun plainBtn(label: String, act: () -> Unit): Button = Button(this).apply {
+        text = label
+        setOnClickListener { act() }
+    }
+
+    private fun rowBtn(label: String, act: () -> Unit): Button = Button(this).apply {
+        text = label
+        textSize = 12f
+        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        setOnClickListener { act() }
+    }
 
     private fun refreshStatus() {
         val s = ServiceBridge.service
@@ -88,10 +113,44 @@ class MainActivity : Activity() {
         logView.text = if (raw.isEmpty()) "(kayıt yok)" else raw.lines().reversed().joinToString("\n")
     }
 
+    // Metni aktif yuvalara yükler, servise haber verir
+    private fun loadText(t: String): String {
+        val res = SlotStore.parse(t)
+        val p = res.parsed ?: return "Hata: ${res.error}"
+        val prefs = getSharedPreferences(SlotStore.PREFS, MODE_PRIVATE)
+        val sets = getSharedPreferences(SlotStore.SET, MODE_PRIVATE)
+        val ok = SlotStore.apply(prefs, p, sets)
+        ServiceBridge.service?.onExternalLoad()
+        val back = SlotStore.format(prefs, p.screen, if (p.set != null) sets else null) ?: ""
+        val same = norm(back) == norm(t)
+        return (if (!ok) "Kayıt başarısız!\n" else "") +
+            (if (same) "AYNI ✓ (yüklendi, tekrar dışa aktarım birebir aynı)\n\n"
+            else "FARK VAR ✗ (aşağıdaki metin yüklenen halidir)\n\n") + back
+    }
+
+    private fun refreshRecords() {
+        recBox.removeAllViews()
+        val list = SlotStore.recList(recPrefs())
+        if (list.isEmpty()) {
+            recBox.addView(TextView(this).apply { text = "(kayıt yok. Panelde Kaydet düğmesine bas)" })
+            return
+        }
+        for ((n, t) in list) {
+            val scr = Regex("screen=(\\S+)").find(t)?.groupValues?.get(1) ?: "?"
+            recBox.addView(TextView(this).apply { text = "Kayıt $n  (ekran $scr)"; textSize = 15f })
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(rowBtn("Yükle") { out.text = loadText(t); refreshStatus() })
+            row.addView(rowBtn("Kopyala") { copyText("bsstart-$n", t) })
+            row.addView(rowBtn("Sil") { SlotStore.recDelete(recPrefs(), n); refreshRecords() })
+            recBox.addView(row)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         refreshStatus()
         refreshLog()
+        refreshRecords()
     }
 
     private fun addSettings(col: LinearLayout) {
@@ -111,17 +170,13 @@ class MainActivity : Activity() {
         }
         col.addView(limitInfo)
         col.addView(limitInput)
-        col.addView(Button(this).apply {
-            text = "Kupa sınırını kaydet"
-            setOnClickListener {
-                val v = limitInput.text.toString().trim().toIntOrNull()
-                if (v == null || v < SlotStore.MIN_LIMIT || v > SlotStore.MAX_LIMIT) {
-                    Toast.makeText(this@MainActivity,
-                        "${SlotStore.MIN_LIMIT}-${SlotStore.MAX_LIMIT} arası bir sayı gir", Toast.LENGTH_SHORT).show()
-                } else {
-                    sp.edit().putInt("limit", v).apply()
-                    showLimit()
-                }
+        col.addView(plainBtn("Kupa sınırını kaydet") {
+            val v = limitInput.text.toString().trim().toIntOrNull()
+            if (v == null || v < SlotStore.MIN_LIMIT || v > SlotStore.MAX_LIMIT) {
+                say("${SlotStore.MIN_LIMIT}-${SlotStore.MAX_LIMIT} arası bir sayı gir")
+            } else {
+                sp.edit().putInt("limit", v).apply()
+                showLimit()
             }
         })
 
@@ -157,21 +212,20 @@ class MainActivity : Activity() {
 
         status = TextView(this).apply { textSize = 16f }
         col.addView(status)
-        col.addView(Button(this).apply {
-            text = "Paneli göster / gizle"
-            setOnClickListener {
-                val s = ServiceBridge.service
-                if (s == null) {
-                    Toast.makeText(this@MainActivity, "Servis kapalı, önce erişilebilirliği aç", Toast.LENGTH_SHORT).show()
-                } else {
-                    s.setPanelVisible(!s.isPanelVisible())
-                }
-                refreshStatus()
-            }
+        col.addView(plainBtn("Paneli göster / gizle") {
+            val s = ServiceBridge.service
+            if (s == null) say("Servis kapalı, önce erişilebilirliği aç")
+            else s.setPanelVisible(!s.isPanelVisible())
+            refreshStatus()
         })
-        col.addView(Button(this).apply {
-            text = "Erişilebilirlik ayarlarını aç"
-            setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+        col.addView(plainBtn("Sıfırdan yeni panel aç") {
+            val s = ServiceBridge.service
+            if (s == null) say("Servis kapalı, önce erişilebilirliği aç")
+            else { s.openFresh(); say("Yeni panel açılıyor") }
+            refreshStatus()
+        })
+        col.addView(plainBtn("Erişilebilirlik ayarlarını aç") {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
         col.addView(TextView(this).apply {
             text = "Android 13+ ve APK'yı dışarıdan yüklediysen izin gri olabilir: " +
@@ -185,50 +239,52 @@ class MainActivity : Activity() {
             textSize = 15f
         })
 
-        col.addView(TextView(this).apply { text = "KAYIT DEFTERİ (en yeni üstte)"; textSize = 15f })
-        logView = TextView(this).apply { textSize = 12f; setTextIsSelectable(true) }
-        col.addView(Button(this).apply {
-            text = "Kayıtları yenile"
-            setOnClickListener { refreshLog() }
+        col.addView(TextView(this).apply { text = "KAYITLAR"; textSize = 15f })
+        recBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(recBox)
+        col.addView(plainBtn("Tüm kayıtları kopyala") {
+            val l = SlotStore.recList(recPrefs())
+            if (l.isEmpty()) say("Kayıt yok")
+            else copyText("bsstart-all", l.joinToString("\n") { "=== Kayıt ${it.first} ===\n${it.second}" })
         })
-        col.addView(Button(this).apply {
-            text = "Kayıtları sil"
-            setOnClickListener {
-                getSharedPreferences("bslog", MODE_PRIVATE).edit().clear().apply()
-                refreshLog()
-            }
-        })
-        col.addView(logView)
 
-        col.addView(TextView(this).apply { text = "\nYUVA YEDEĞİ"; textSize = 15f })
+        col.addView(TextView(this).apply { text = "\nMETİNDEN YÜKLE"; textSize = 15f })
         val input = EditText(this).apply {
-            hint = "Kopyalanan yuva metnini buraya yapıştır"
+            hint = "Kopyalanan metni (tek kayıt veya tüm kayıtlar) buraya yapıştır"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
             minLines = 6
             gravity = Gravity.TOP or Gravity.START
         }
-        val out = TextView(this)
+        out = TextView(this)
         col.addView(input)
-        col.addView(Button(this).apply {
-            text = "OK"
-            setOnClickListener {
-                val txt = input.text.toString()
-                val res = SlotStore.parse(txt)
-                val parsed = res.parsed
-                if (parsed == null) {
-                    out.text = "Hata: ${res.error}"
-                    return@setOnClickListener
-                }
-                val prefs = getSharedPreferences(SlotStore.PREFS, MODE_PRIVATE)
-                val saved = SlotStore.apply(prefs, parsed)
-                val back = SlotStore.format(prefs, parsed.screen) ?: ""
-                val same = norm(back) == norm(txt)
-                out.text = (if (!saved) "Kayıt başarısız!\n" else "") +
-                    (if (same) "AYNI ✓ (yüklendi, tekrar dışa aktarım birebir aynı)\n\n"
-                    else "FARK VAR ✗ (aşağıdaki metin yüklenen halidir)\n\n") + back
+        col.addView(plainBtn("Yükle (aktif yap)") {
+            val txt = input.text.toString()
+            val first = SlotStore.splitBlocks(txt).firstOrNull() ?: txt
+            out.text = loadText(first)
+            refreshStatus()
+        })
+        col.addView(plainBtn("Kayıtlara ekle") {
+            val blocks = SlotStore.splitBlocks(input.text.toString())
+            var added = 0
+            var bad = 0
+            for (b in blocks) {
+                if (SlotStore.parse(b).parsed != null) { SlotStore.recAdd(recPrefs(), b); added++ } else bad++
             }
+            out.text = if (blocks.isEmpty()) "Hata: metinde '${SlotStore.HEADER}' başlığı yok"
+            else "$added kayıt eklendi" + (if (bad > 0) ", $bad geçersiz atlandı" else "")
+            refreshRecords()
         })
         col.addView(out)
+
+        col.addView(TextView(this).apply { text = "\nKAYIT DEFTERİ (en yeni üstte)"; textSize = 15f })
+        logView = TextView(this).apply { textSize = 12f; setTextIsSelectable(true) }
+        col.addView(plainBtn("Günlüğü yenile") { refreshLog() })
+        col.addView(plainBtn("Günlüğü sil") {
+            getSharedPreferences("bslog", MODE_PRIVATE).edit().clear().apply()
+            refreshLog()
+        })
+        col.addView(logView)
+
         setContentView(ScrollView(this).apply { addView(col) })
     }
 }
