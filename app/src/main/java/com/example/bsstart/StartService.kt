@@ -78,11 +78,15 @@ class StartService : AccessibilityService() {
                 when {
                     key == "scale" -> rebuildPanel()
                     key == "ttot" -> { ensureScan(); updateTotUi() }
-                    key == "atrophy" -> if (!trophyCheckOn()) abortTrophy()
                     key != null && key.startsWith("btn_") -> applyVisibility()
                 }
             }
         }
+
+    // Saldırı (yuva 2) basış hızı: saniyede kaç kez, ayarlardan gelir (0.3-10, varsayılan 3)
+    private fun attackRate() = sets.getFloat("atkrate", SlotStore.DEFAULT_ATK_RATE)
+        .coerceIn(SlotStore.MIN_ATK_RATE, SlotStore.MAX_ATK_RATE)
+    private fun attackPeriodMs(): Long = max(1L, (1000f / attackRate()).toLong())
 
     private fun limit() = sets.getInt("limit", SlotStore.DEFAULT_LIMIT)
         .coerceIn(SlotStore.MIN_LIMIT, SlotStore.MAX_LIMIT)
@@ -213,7 +217,6 @@ class StartService : AccessibilityService() {
         val IF_COLOR = Color.parseColor("#CDDC39")
 
         const val SCAN_PERIOD_MS = 350L
-        const val COMBAT_PERIOD_MS = 333L    // saniyede 3
         const val TAP_MS = 30L
         const val GATE_FRESH_MS = 15000L
         const val DEAD_HOLD_MS = 60000L
@@ -243,7 +246,6 @@ class StartService : AccessibilityService() {
         const val REQUIRED_VOTES = 3
         const val SWITCH_VOTES = 4          // karakter değiştirmek için gereken oy
         const val SUSPECT_SLACK = 10        // olası kupa aralığının dışında kabul edilen pay
-        const val MATCH_DROP = 5            // maç başına en fazla kupa kaybı (tabloya göre)
         const val MAX_FAIL_CYCLES = 20
         const val READ_TIMEOUT_MS = 30000L
         const val STEP_TIMEOUT_MS = 12000L
@@ -1174,7 +1176,14 @@ class StartService : AccessibilityService() {
             toast("$have/${SlotStore.REQUIRED.size} zorunlu yuva (1, 2, 4, 5) dolu, kaydedilmedi"); return
         }
         val (n, added) = SlotStore.recAddUnique(recPrefs(), text)
-        toast(if (added) "Kaydedildi (Kayıt $n)" else "Zaten kayıtlı (Kayıt $n), tekrar kaydedilmedi")
+        val cnt = SlotStore.recList(recPrefs()).size
+        toast(
+            when {
+                n < 0 -> "Kayıt sınırı dolu ($cnt/${SlotStore.MAX_RECORDS}), önce uygulamadan birini sil"
+                added -> "Kaydedildi (Kayıt $n) ($cnt/${SlotStore.MAX_RECORDS})"
+                else -> "Zaten kayıtlı (Kayıt $n), tekrar kaydedilmedi"
+            }
+        )
     }
 
     // --- Yuvalar ---
@@ -1697,13 +1706,10 @@ class StartService : AccessibilityService() {
             ensureScan()
             if (!combatRunning) { combatRunning = true; nextTapAt = 0L; ui.post(combatTick) }
             note("Döngü başlatıldı")
-            logRead("başlatıldı: sınır ${limit()}, otomatik kupa ${if (trophyCheckOn()) "açık" else "kapalı"}")
+            logRead("başlatıldı: sınır ${limit()}, kupa kontrolü ${if (trophyCheckOn()) "açık" else "kapalı"}, saldırı ${attackRate()}/sn")
             val missing = SlotStore.REQUIRED.filter { !slotReady(it) }
-            val ocr = when {
-                trophyCheckOn() -> "kupa kontrolü AÇIK (sınır ${limit()})"
-                !SlotStore.autoTrophy(sets, prefs) -> "otomatik kupa KAPALI"
-                else -> "kupa alanı yok, kontrol kapalı"
-            }
+            val ocr = if (trophyCheckOn()) "kupa kontrolü AÇIK (sınır ${limit()})"
+            else "kupa alanı yok, kontrol kapalı"
             val ifc = (1..8).count { slotReady(IF_BASE + it) }
             val aifc = (1..8).count { aifReady(it) }
             val ifs = (if (ifc > 0) ", $ifc if" else "") + (if (aifc > 0) ", $aifc if%" else "")
@@ -1738,19 +1744,21 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // Saniyede 3 basış. if (2) veya if% (2) varsa sadece o koşul görünürken basar.
+    // Saldırı basışı ayarlardaki hızda (varsayılan saniyede 3). if (2) veya if% (2) varsa sadece o koşul görünürken basar.
     private val combatTick = object : Runnable {
         override fun run() {
             if (!running) { combatRunning = false; return }
             val now = System.currentTimeMillis()
+            val period = attackPeriodMs()
             val gated = slotReady(ATTACK_IF) || aifReady(ATTACK)
             val ok = if (gated) now - lastAttackSeenMs < IF_HOLD_MS
             else now - lastGateMs < GATE_FRESH_MS
             if (inMatch && ok && phase == Phase.LOOP && slotReady(ATTACK)) {
                 tapSlot(ATTACK)
             }
-            if (nextTapAt == 0L || now - nextTapAt > COMBAT_PERIOD_MS * 3) nextTapAt = now
-            nextTapAt += COMBAT_PERIOD_MS
+            if (nextTapAt == 0L || now - nextTapAt > period * 3) nextTapAt = now
+            nextTapAt += period
+            if (nextTapAt - now > period) nextTapAt = now + period   // hız ayarı düşükten yükseğe değişirse hemen uyar
             ui.postDelayed(this, max(1L, nextTapAt - System.currentTimeMillis()))
         }
     }
@@ -1782,11 +1790,12 @@ class StartService : AccessibilityService() {
             hc[2] >= hr[2] * 0.55f && hc[2] <= hr[2] * 1.35f + 0.05f
     }
 
-    // Her maç başında olası kupa aralığı genişler: en fazla +10, en fazla -5
+    // Her maç başında olası kupa aralığı genişler: en fazla +10, kayıp kupa tablosuna göre (TrophyTable)
     private fun onMatchStart() {
         needCheck = true
         trophyUpper = trophyUpper?.plus(10)
-        trophyLow = trophyLow?.let { max(0, it - MATCH_DROP) }
+        val up = trophyUpper
+        trophyLow = trophyLow?.let { lo -> max(0, lo - TrophyTable.lossAt(up ?: lo)) }
         note("Maç başladı")
     }
 
