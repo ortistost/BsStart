@@ -10,18 +10,18 @@ object SlotStore {
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
     const val MAX_LIMIT = 3000
-    const val SLOTS = 8
-    const val CORE = 5
+    const val SLOTS = 9
     const val HEADER = "BsStart slots v2"
+    val REQUIRED = intArrayOf(1, 2, 4, 5)
     val NAMES = arrayOf(
         "", "Maça gir", "Saldırı", "Devam 1", "Devam 2", "Çıkış",
-        "Savaşçılar", "Karakter", "Seç"
+        "Savaşçılar", "Karakter", "Seç", "Koşul"
     )
 
     fun ready(p: SharedPreferences, i: Int) =
         p.contains("c$i") && p.getFloat("x$i", -1f) >= 0f
 
-    fun coreReady(p: SharedPreferences) = (1..CORE).all { ready(p, it) }
+    fun coreReady(p: SharedPreferences) = REQUIRED.all { ready(p, it) }
 
     fun rectReady(p: SharedPreferences) =
         listOf("ox1", "oy1", "ox2", "oy2").all { p.contains(it) }
@@ -29,7 +29,6 @@ object SlotStore {
     fun totReady(p: SharedPreferences) =
         listOf("tx1", "ty1", "tx2", "ty2").all { p.contains(it) }
 
-    // Çekirdek 5 yuva dolu değilse null. Dolu olan 6-8, OCR, TOT alanları ve (verilirse) ayarlar eklenir.
     fun format(p: SharedPreferences, screen: String, sets: SharedPreferences? = null): String? {
         if (!coreReady(p)) return null
         val sb = StringBuilder("$HEADER screen=$screen\n")
@@ -99,34 +98,16 @@ object SlotStore {
         return v
     }
 
-    // Karşılaştırma için metni normalleştirir
     fun norm(s: String) =
         s.replace("\r", "").lines().map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("===") }
             .joinToString("\n").lowercase(Locale.ROOT)
 
-    // Birden çok kayıt yapıştırılmışsa başlık satırlarından böler; "===" satırları yok sayılır
-    fun splitBlocks(text: String): List<String> {
-        val out = ArrayList<String>()
-        var cur: StringBuilder? = null
-        for (raw in text.replace("\r", "").lines()) {
-            val l = raw.trim()
-            if (l.startsWith("===")) continue
-            if (l.startsWith(HEADER)) {
-                cur?.let { out.add(it.toString()) }
-                cur = StringBuilder()
-            }
-            cur?.append(l)?.append('\n')
-        }
-        cur?.let { out.add(it.toString()) }
-        return out
-    }
-
     fun parse(text: String): ParseResult {
         val lines = text.replace("\r", "").lines().map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("===") }
         if (lines.isEmpty() || !lines[0].startsWith(HEADER))
-            return err("İlk satır '$HEADER' ile başlamalı (eski v1 metni geçmez)")
+            return err("İlk satır '$HEADER' ile başlamalı")
         val screen = Regex("screen=(\\S+)").find(lines[0])?.groupValues?.get(1) ?: "?"
 
         val xs = FloatArray(SLOTS + 1); val ys = FloatArray(SLOTS + 1)
@@ -174,7 +155,7 @@ object SlotStore {
             }
             return err("Tanınmayan satır: $line")
         }
-        val missing = (1..CORE).filter { !have[it] }
+        val missing = REQUIRED.filter { !have[it] }
         if (missing.isNotEmpty()) return err("Eksik yuvalar: $missing")
         return ParseResult(Parsed(xs, ys, cs, have, rect, tot, set, screen), null)
     }
@@ -214,7 +195,6 @@ object SlotStore {
             else null
         }.sortedBy { it.first }
 
-    // Aynı içerik zaten varsa eklemez. (kayıt no, eklendi mi)
     fun recAddUnique(r: SharedPreferences, text: String): Pair<Int, Boolean> {
         val want = norm(text)
         recList(r).firstOrNull { norm(it.second) == want }?.let { return it.first to false }
@@ -251,7 +231,6 @@ object TrophyParser {
         }
     }.joinToString("")
 
-    // Karakter kupası: satır satır okur; okunamazsa veya makul değilse null
     fun parse(raw: String?): Int? {
         if (raw == null) return null
         val found = ArrayList<Int>()
@@ -268,7 +247,6 @@ object TrophyParser {
         return found.maxWithOrNull(compareBy<Int>({ it.toString().length }, { it }))
     }
 
-    // Toplam kupa: "50,200" / "50 200" / "50.200" biçimlerini de kabul eder
     fun parseTotal(raw: String?): Int? {
         if (raw == null) return null
         var best: Int? = null
