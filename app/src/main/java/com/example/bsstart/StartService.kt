@@ -51,7 +51,7 @@ class StartService : AccessibilityService() {
     // Okuma oyu: hangi değer, hangi ekran karesinden (en az MIN_FRAMES farklı kare gerekir)
     private class Vote(val value: Int, val frame: Int)
 
-    // Bir ekran karesindeki tüm görüntü varyantlarının OCR sonucu (varyant sırasına göre)
+    // Bir ekran karesindeki görüntü varyantlarının OCR sonucu (varyant numarasına göre)
     private class FrameRead(val raws: Array<String?>, val vals: Array<Int?>) {
         var info: String = ""
         fun values(): List<Int> = vals.filterNotNull()
@@ -234,7 +234,10 @@ class StartService : AccessibilityService() {
         const val OCR_TARGET_H2 = 192       // varyant ölçeği 2
         const val STYLES = 8                // görüntü işleme biçimi sayısı (0-5 eski, 6-7 Otsu)
         const val VARIANTS = STYLES * 2     // 8 biçim x 2 ölçek
-        const val MAX_READ_ATTEMPTS = 6     // bir okuma turunda en fazla bu kadar ekran karesi
+        const val MAX_READ_ATTEMPTS = 8     // bir okuma turunda en fazla bu kadar ekran karesi
+        const val VARIANTS_PER_FRAME = 4    // döngüde her ekran karesinde okunan varyant sayısı
+        const val FRAME_OCR_TIMEOUT_MS = 4000L  // bir karenin OCR'ı bunu aşarsa eldeki sonuçla devam edilir
+        const val LIVE_TIMEOUT_MS = 12000L  // Test oku en geç bu sürede cevap verir
         const val MIN_FRAMES = 2            // kazanan değer en az bu kadar farklı karede görülmeli
         const val REQUIRED_VOTES = 3
         const val SWITCH_VOTES = 4          // karakter değiştirmek için gereken oy
@@ -1471,30 +1474,48 @@ class StartService : AccessibilityService() {
 
     // --- Kupa okuma (hem sistem hem test aynı hattı kullanır) ---
 
-    // Bir ekran karesinde okuma alanını tüm VARIANTS varyantıyla okur; hepsi bitince cb çağrılır.
-    // bmp yalnızca bu çağrı dönene kadar geçerli: kırpmalar burada, eşzamanlı alınır.
-    // Okuma alanı geçersizse cb(null).
-    private fun readFrame(bmp: Bitmap, cb: (FrameRead?) -> Unit) {
-        val crops = arrayOfNulls<Bitmap>(VARIANTS)
-        var made = 0
-        for (v in 0 until VARIANTS) {
+    // Bir ekran karesinde okuma alanını verilen varyantlarla okur. Hepsi bitince ya da FRAME_OCR_TIMEOUT_MS
+    // sonra (eldeki sonuçlarla) cb çağrılır. bmp yalnızca bu çağrı dönene kadar geçerli, kırpmalar burada
+    // eşzamanlı alınır. Okuma alanı geçersizse cb(null).
+    private fun readFrame(bmp: Bitmap, variants: IntArray, cb: (FrameRead?) -> Unit) {
+        val vs = ArrayList<Int>()
+        val crops = ArrayList<Bitmap>()
+        for (v in variants) {
             val c = cropForOcr(bmp, v)
-            if (c != null) { crops[v] = c; made++ }
+            if (c != null) { vs.add(v); crops.add(c) }
         }
-        if (made == 0) { cb(null); return }
+        if (crops.isEmpty()) { cb(null); return }
         val fr = FrameRead(arrayOfNulls<String>(VARIANTS), arrayOfNulls<Int>(VARIANTS))
         fr.info = regionStats(bmp, "o")
-        var left = made
-        for (v in 0 until VARIANTS) {
-            val c = crops[v] ?: continue
-            recognize(c) { raw ->
-                fr.raws[v] = clean(raw)
-                fr.vals[v] = TrophyParser.parse(raw)
+        var left = crops.size
+        var finished = false
+        fun finish() {
+            if (finished) return
+            finished = true
+            cb(fr)
+        }
+        ui.postDelayed({
+            if (!finished) {
+                logRead("okuma süresi doldu: ${vs.size - left}/${vs.size} varyant bitti")
+                finish()
+            }
+        }, FRAME_OCR_TIMEOUT_MS)
+        for (i in crops.indices) {
+            val v = vs[i]
+            recognize(crops[i]) { raw ->
+                if (!finished) {
+                    fr.raws[v] = clean(raw)
+                    fr.vals[v] = TrophyParser.parse(raw)
+                }
                 left--
-                if (left == 0) cb(fr)
+                if (left == 0) finish()
             }
         }
     }
+
+    // Döngüde her kare VARIANTS_PER_FRAME varyant okur, kareler arasında varyantlar döner
+    private fun frameVariants(frame: Int): IntArray =
+        IntArray(VARIANTS_PER_FRAME) { (frame * VARIANTS_PER_FRAME + it) % VARIANTS }
 
     private fun tallyText(vals: List<Int>): String {
         if (vals.isEmpty()) return "(boş)"
@@ -1535,20 +1556,24 @@ class StartService : AccessibilityService() {
 
     private fun lumaOfPixel(p: Int) = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
 
-    // Test oku: birkaç ekran karesi x 16 varyant, oy çoğunluğu. Sadece hiçbir varyant sayı bulamazsa "Yok".
+    // Test oku: birkaç ekran karesi, turda 8 varyant, oy çoğunluğu.
+    // En geç LIVE_TIMEOUT_MS sonra cevap verir: sayı ya da "Yok". Etikette sadece sayı görünür.
     private fun liveRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
         if (running) { toast("Önce döngüyü durdur"); return }
         val t0 = System.currentTimeMillis()
-        if (liveBusy && t0 - liveStartMs < 15000L) return
+        if (liveBusy && t0 - liveStartMs < LIVE_TIMEOUT_MS + 1000L) { toast("Okuma sürüyor, bekle"); return }
         liveBusy = true
         liveStartMs = t0
         val votes = ArrayList<Int>()
         val raws = ArrayList<String>()
         var total = 0
         var info = ""
+        var done = false
 
         fun finish(why: String?) {
+            if (done) return
+            done = true
             liveBusy = false
             val best = votes.groupingBy { it }.eachCount().maxByOrNull { it.value }
             if (best == null) {
@@ -1558,27 +1583,34 @@ class StartService : AccessibilityService() {
                 toast(msg)
                 logRead("test: $msg | $info")
             } else {
-                showLabel("${best.key} (${best.value}/$total)")
+                showLabel(best.key.toString())
                 logRead("test: ${best.key} ${best.value}/$total oy | $info")
             }
         }
 
+        ui.postDelayed({ finish("Zaman aşımı") }, LIVE_TIMEOUT_MS)
+
         fun round(n: Int) {
+            if (done) return
             withScreenshotWait { bmp ->
-                if (bmp == null) {
+                if (done) {
+                    // zaman aşımı geçti, sonuç zaten bildirildi
+                } else if (bmp == null) {
                     finish("Ekran görüntüsü alınamadı")
                 } else {
-                    readFrame(bmp) { fr ->
-                        if (fr == null) {
-                            finish("Okuma alanı geçersiz")
-                        } else {
-                            total += fr.total()
-                            info = fr.info
-                            votes.addAll(fr.values())
-                            raws.addAll(fr.raws.filterNotNull())
-                            val top = votes.groupingBy { it }.eachCount().maxOfOrNull { it.value } ?: 0
-                            if (top >= 2 || n >= 2) finish(null)
-                            else ui.postDelayed({ round(n + 1) }, 350)
+                    readFrame(bmp, IntArray(8) { (n % 2) * 8 + it }) { fr ->
+                        if (!done) {
+                            if (fr == null) {
+                                finish("Okuma alanı geçersiz")
+                            } else {
+                                total += fr.total()
+                                info = fr.info
+                                votes.addAll(fr.values())
+                                raws.addAll(fr.raws.filterNotNull())
+                                val top = votes.groupingBy { it }.eachCount().maxOfOrNull { it.value } ?: 0
+                                if (top >= 2 || n >= 2) finish(null)
+                                else ui.postDelayed({ round(n + 1) }, 350)
+                            }
                         }
                     }
                 }
@@ -1595,7 +1627,7 @@ class StartService : AccessibilityService() {
             if (bmp == null) {
                 toast("Ekran alınamadı")
             } else {
-                readFrame(bmp) { fr ->
+                readFrame(bmp, IntArray(VARIANTS) { it }) { fr ->
                     if (fr == null) {
                         toast("Okuma alanı geçersiz")
                     } else {
@@ -1854,7 +1886,8 @@ class StartService : AccessibilityService() {
         }
         ocrBusy = true
         val s = session
-        readFrame(bmp) { fr ->
+        // Her karede yalnızca VARIANTS_PER_FRAME varyant okunur (16'sı birden telefonu yavaşlatıyordu)
+        readFrame(bmp, frameVariants(readAttempts)) { fr ->
             if (s == session) {
                 ocrBusy = false
                 if (fr == null) stopAll("Okuma alanı geçersiz: sistem durdu") else onRead(fr)
