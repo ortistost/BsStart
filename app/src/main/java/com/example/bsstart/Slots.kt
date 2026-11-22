@@ -9,6 +9,9 @@ object SlotStore {
     const val REC = "bsrec"
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
+    const val DEFAULT_AIF = 90    // if% eşiği (%)
+    const val MIN_AIF = 50
+    const val MAX_AIF = 100
     const val MAX_LIMIT = 3000
     const val MIN_SCALE = 0.6f
     const val MAX_SCALE = 1.25f
@@ -40,7 +43,7 @@ object SlotStore {
 
     val BUTTONS = listOf(
         "move" to "Taşı", "mini" to "Küçült / Büyült", "main" to "Başlat / Durdur",
-        "calib" to "Yuva kaydet", "if" to "If", "del" to "Hepsini sil", "undo" to "Geri al",
+        "calib" to "Yuva kaydet", "if" to "If", "aif" to "If%", "del" to "Hepsini sil", "undo" to "Geri al",
         "eye" to "Halkalar", "area" to "Alan seç", "live" to "Test oku",
         "tot" to "Toplam", "save" to "Kaydet", "colors" to "Renkler", "off" to "Gizle"
     )
@@ -53,6 +56,33 @@ object SlotStore {
 
     fun ready(p: SharedPreferences, i: Int) =
         p.contains("c$i") && p.getFloat("x$i", -1f) >= 0f
+
+    // if% kaydı tek satırlık metindir: x1,y1,x2,y2,gw,gh,HEX (HEX = hücre başına RRGGBB)
+    fun aifEncode(r: AifRef): String {
+        val sb = StringBuilder()
+        sb.append(String.format(Locale.US, "%.4f,%.4f,%.4f,%.4f,%d,%d,", r.x1, r.y1, r.x2, r.y2, r.gw, r.gh))
+        for (c in r.rgb) sb.append(String.format(Locale.US, "%06X", c and 0xFFFFFF))
+        return sb.toString()
+    }
+
+    // Geçersiz ya da bozuk kayıt için null
+    fun aifDecode(raw: String): AifRef? {
+        val f = raw.trim().split(",")
+        if (f.size != 7) return null
+        val x1 = f[0].toFloatOrNull() ?: return null
+        val y1 = f[1].toFloatOrNull() ?: return null
+        val x2 = f[2].toFloatOrNull() ?: return null
+        val y2 = f[3].toFloatOrNull() ?: return null
+        val gw = f[4].toIntOrNull() ?: return null
+        val gh = f[5].toIntOrNull() ?: return null
+        if (listOf(x1, y1, x2, y2).any { it !in 0f..1f } || x2 <= x1 || y2 <= y1) return null
+        if (gw !in 4..64 || gh !in 4..64) return null
+        val hex = f[6]
+        if (hex.length != gw * gh * 6) return null
+        val rgb = IntArray(gw * gh)
+        for (i in rgb.indices) rgb[i] = hex.substring(i * 6, i * 6 + 6).toIntOrNull(16) ?: return null
+        return AifRef(x1, y1, x2, y2, gw, gh, rgb)
+    }
 
     fun coreReady(p: SharedPreferences) = REQUIRED.all { ready(p, it) }
 
@@ -74,6 +104,10 @@ object SlotStore {
                     p.getInt("c$i", 0) and 0xFFFFFF
                 )
             )
+        }
+        for (n in 1..8) {
+            val raw = p.getString("aif_$n", null) ?: continue
+            if (aifDecode(raw) != null) sb.append("AIF $n $raw\n")
         }
         if (rectReady(p)) {
             sb.append(
@@ -109,7 +143,8 @@ object SlotStore {
     class Parsed(
         val xs: FloatArray, val ys: FloatArray, val colors: IntArray,
         val have: BooleanArray, val rect: FloatArray?, val tot: FloatArray?,
-        val set: Triple<Int, Float, Boolean>?, val screen: String
+        val set: Triple<Int, Float, Boolean>?, val screen: String,
+        val aif: Map<Int, String> = emptyMap()
     )
 
     class ParseResult(val parsed: Parsed?, val error: String?)
@@ -120,6 +155,8 @@ object SlotStore {
         Regex("""^OCR\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
     private val TOT_RE =
         Regex("""^TOT\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
+    private val AIF_RE =
+        Regex("""^AIF\s+(\d)\s+(\S+)$""")
     private val SET_RE =
         Regex("""^SET\s+limit=(\d+)\s+scale=([0-9.]+)\s+tot=([01])$""")
 
@@ -148,6 +185,7 @@ object SlotStore {
         var rect: FloatArray? = null
         var tot: FloatArray? = null
         var set: Triple<Int, Float, Boolean>? = null
+        val aifMap = HashMap<Int, String>()
 
         for (line in lines.drop(1)) {
             val m = SLOT_RE.find(line)
@@ -163,6 +201,15 @@ object SlotStore {
                 xs[i] = x; ys[i] = y
                 cs[i] = (0xFF shl 24) or m.groupValues[4].toInt(16)
                 have[i] = true
+                continue
+            }
+            val a = AIF_RE.find(line)
+            if (a != null) {
+                val n = a.groupValues[1].toInt()
+                if (n !in 1..6) return err("if% yuva numarası geçersiz: ${line.take(20)}")
+                if (aifMap.containsKey(n)) return err("if% $n iki kere var")
+                if (aifDecode(a.groupValues[2]) == null) return err("if% $n kaydı bozuk")
+                aifMap[n] = a.groupValues[2]
                 continue
             }
             val r = RECT_RE.find(line)
@@ -191,7 +238,7 @@ object SlotStore {
         }
         val missing = REQUIRED.filter { !have[it] }
         if (missing.isNotEmpty()) return err("Eksik yuvalar: $missing")
-        return ParseResult(Parsed(xs, ys, cs, have, rect, tot, set, screen), null)
+        return ParseResult(Parsed(xs, ys, cs, have, rect, tot, set, screen, aifMap), null)
     }
 
     fun apply(p: SharedPreferences, d: Parsed, sets: SharedPreferences? = null): Boolean {
@@ -200,6 +247,7 @@ object SlotStore {
             if (!d.have[i]) continue
             e.putFloat("x$i", d.xs[i]).putFloat("y$i", d.ys[i]).putInt("c$i", d.colors[i])
         }
+        for ((n, raw) in d.aif) e.putString("aif_$n", raw)
         d.rect?.let {
             e.putFloat("ox1", it[0]).putFloat("oy1", it[1])
                 .putFloat("ox2", it[2]).putFloat("oy2", it[3])
