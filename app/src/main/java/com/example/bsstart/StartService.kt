@@ -49,13 +49,12 @@ object ServiceBridge {
 class StartService : AccessibilityService() {
 
     private enum class Phase { LOOP, READING, SWITCH }
-    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, CLIP, SCREEN, HELP, CROSS, TROPHY, SAVE }
+    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, CLIP, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW }
 
     private lateinit var wm: WindowManager
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences(SlotStore.PREFS, MODE_PRIVATE) }
     private val sets by lazy { getSharedPreferences(SlotStore.SET, MODE_PRIVATE) }
-    private val logPrefs by lazy { getSharedPreferences("bslog", MODE_PRIVATE) }
     private val prefListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refreshMarkers(); updateTotUi() }
     private val setListener =
@@ -64,7 +63,6 @@ class StartService : AccessibilityService() {
                 when (key) {
                     "scale" -> rebuildPanel()
                     "ttot" -> { ensureScan(); updateTotUi() }
-                    "limit" -> log("Kupa sınırı: ${limit()}")
                 }
             }
         }
@@ -75,14 +73,17 @@ class StartService : AccessibilityService() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun d(v: Int) = max(1, (v * resources.displayMetrics.density * scale()).toInt())
     private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
-    private fun bkPrefs() = getSharedPreferences(SlotStore.BACKUP, MODE_PRIVATE)
 
     private var panel: View? = null
     private var panelLp: WindowManager.LayoutParams? = null
     private var panelShown = true
+    private var minimized = false
     private var mainItem: Item? = null
     private var eyeItem: Item? = null
     private var totItem: Item? = null
+    private var miniItem: Item? = null
+    private var hideWhenMin: List<Item> = emptyList()
+    private val iconViews = ArrayList<View>()
     private var calibLayer: View? = null
     private var markers: MarkerView? = null
     private var markersOn = true
@@ -90,6 +91,7 @@ class StartService : AccessibilityService() {
     private var labelToken = 0
     private var rectToken = 0
     private var rectPending = false
+    private var liveBusy = false
 
     private var undoSnap: HashMap<String, Any?>? = null
     private var undoNext = 1
@@ -99,17 +101,14 @@ class StartService : AccessibilityService() {
     private var combatRunning = false
     private var nextTapAt = 0L
     private var shotBusy = false
-    private var shotFails = 0
     private var nextSlot = 1
-    private var lastPkg: String? = null
-    private var pkgSince = 0L
-    private var lastProgressMs = 0L
 
     // Maç kapısı
     private var inMatch = false
     private var hitStreak = 0
     private var lastAttackSeenMs = 0L
     private var lastGateMs = 0L
+    private val endStreak = IntArray(SlotStore.SLOTS + 1)
 
     // Toplam kupa takibi
     private var totBase: Int? = null
@@ -138,7 +137,6 @@ class StartService : AccessibilityService() {
     private val lastTapMs = LongArray(SlotStore.SLOTS + 1)
 
     private companion object {
-        const val GAME_PKG = "com.supercell.brawlstars"   // Ayarlar > Uygulamalar'dan doğrula
         const val SLOTS = SlotStore.SLOTS
         const val PLAY = 1
         const val ATTACK = 2
@@ -156,20 +154,21 @@ class StartService : AccessibilityService() {
         const val SCAN_PERIOD_MS = 350L      // sistem sınırı ~333 ms olabilir, doğrulanmadı
         const val COMBAT_PERIOD_MS = 200L    // saniyede 5, sabit hız
         const val TAP_MS = 30L
-        const val GATE_FRESH_MS = 5000L      // ekran okuması bu kadar süre gelmezse vuruş durur
-        const val DEAD_HOLD_MS = 25000L      // saldırı düğmesi bu kadar görünmezse maç dışı (kalibre edilmedi)
+        const val GATE_FRESH_MS = 15000L     // ekran okuması bu kadar süre gelmezse vuruş durur
+        const val DEAD_HOLD_MS = 60000L      // saldırı düğmesi bu kadar görünmezse maç dışı (kalibre edilmedi)
         const val ENTER_HITS = 2
+        const val ABORT_ATTACK_SCANS = 3     // okuma/değiştirme sırasında saldırı düğmesi görünürse iptal
+        const val END_SCANS = 4              // maç sonu düğmesi üst üste kaç taramada görünmeli
+        const val END_TOL = 22               // maç sonu için sıkı renk toleransı (kalibre edilmedi)
         const val SLOT_COOLDOWN_MS = 3000L
         const val CONFIRM_SCANS = 3
         const val COLOR_TOLERANCE = 35       // kalibre edilmedi
         const val HUE_TOL = 20f              // kalibre edilmedi
         const val SAMPLE_RADIUS = 3
         const val LABEL_MS = 3000L
-        const val FOREIGN_PKG_MS = 4000L
-        const val STUCK_MS = 120000L
-        const val LOG_LINES = 150
 
         const val OCR_TARGET_H = 128
+        const val VARIANTS = 4
         const val MAX_READ_ATTEMPTS = 12
         const val REQUIRED_VOTES = 3
         const val MAX_FAIL_CYCLES = 3
@@ -189,15 +188,9 @@ class StartService : AccessibilityService() {
         ServiceBridge.service = this
         resetTotal()
         ensureScan()
-        log("Servis bağlandı")
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        val p = event.packageName?.toString() ?: return
-        if (p == packageName || p == "com.android.systemui") return
-        if (p != lastPkg) { lastPkg = p; pkgSince = System.currentTimeMillis() }
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
 
@@ -231,18 +224,6 @@ class StartService : AccessibilityService() {
         if (v != null) try { wm.removeView(v) } catch (_: Exception) {}
     }
 
-    // --- Kayıt defteri (son 150 satır, "bslog" içinde) ---
-
-    private fun log(m: String) {
-        try {
-            val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-                .format(java.util.Date())
-            val old = logPrefs.getString("l", "") ?: ""
-            val lines = (old.lines().filter { it.isNotEmpty() } + "$t $m").takeLast(LOG_LINES)
-            logPrefs.edit().putString("l", lines.joinToString("\n")).apply()
-        } catch (_: Exception) {}
-    }
-
     // --- Halkalar, okuma çerçeveleri ve toplam kupa yazısı: dokunmayı geçirir ---
 
     private inner class MarkerView(ctx: Context) : View(ctx) {
@@ -255,7 +236,7 @@ class StartService : AccessibilityService() {
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
         }
         private val info = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.LEFT; typeface = Typeface.DEFAULT_BOLD
             color = Color.WHITE
             setShadowLayer(4f, 0f, 0f, Color.BLACK)
         }
@@ -279,7 +260,7 @@ class StartService : AccessibilityService() {
             c.drawText(label, (l + rr) / 2f, t - dp(6), txt)
         }
 
-        // Toplam kupa: çerçevenin altında "50200 (+200)" ve "50000 → 50200"
+        // Toplam kupa: çerçevenin altında "50200 (+200)" (parantez renkli) ve "50000 → 50200"
         private fun drawTotal(c: Canvas, b: Rect) {
             val pad = dp(5).toFloat()
             val top = prefs.getFloat("ty1", 0f) * b.height() - loc[1] - pad
@@ -287,10 +268,9 @@ class StartService : AccessibilityService() {
             val cx = (prefs.getFloat("tx1", 0f) + prefs.getFloat("tx2", 0f)) / 2f * b.width() - loc[0]
             val base = totBase
             val now = totNow
-            val l1 = if (base == null || now == null) "…" else {
-                val dl = now - base
-                "$now (${if (dl >= 0) "+$dl" else "$dl"})"
-            }
+            val dl = if (base == null || now == null) null else now - base
+            val head = if (now == null) "…" else "$now "
+            val par = if (dl == null) "" else if (dl >= 0) "(+$dl)" else "($dl)"
             val l2 = if (base == null || now == null) "… → …" else "$base → $now"
             val ts = dp(14) * scale().coerceIn(0.8f, 1.4f)
             info.textSize = ts
@@ -301,11 +281,23 @@ class StartService : AccessibilityService() {
                 y2 = top - ts * 1.8f
                 y1 = y2 - gap
             }
-            val w = max(info.measureText(l1), info.measureText(l2)) + dp(16)
+            val wh = info.measureText(head)
+            val w1 = wh + info.measureText(par)
+            val w2 = info.measureText(l2)
+            val w = max(w1, w2) + dp(16)
             c.drawRoundRect(RectF(cx - w / 2f, y1 - ts * 1.1f, cx + w / 2f, y2 + ts * 0.5f),
                 dp(8).toFloat(), dp(8).toFloat(), infoBg)
-            c.drawText(l1, cx, y1, info)
-            c.drawText(l2, cx, y2, info)
+            val x0 = cx - w1 / 2f
+            info.color = Color.WHITE
+            c.drawText(head, x0, y1, info)
+            info.color = when {
+                dl == null || dl == 0 -> Color.WHITE
+                dl > 0 -> Color.parseColor("#00E676")
+                else -> Color.parseColor("#FF5252")
+            }
+            c.drawText(par, x0 + wh, y1, info)
+            info.color = Color.WHITE
+            c.drawText(l2, cx - w2 / 2f, y2, info)
         }
 
         override fun onDraw(c: Canvas) {
@@ -390,7 +382,7 @@ class StartService : AccessibilityService() {
     // Her taramada toplam alanını okur; son 6 okumada aynı değer 3 kez çıkınca günceller
     private fun readTotal(bmp: Bitmap) {
         if (totBusy) return
-        val crop = cropRect(bmp, "t", totVar++ % 3) ?: return
+        val crop = cropRect(bmp, "t", totVar++ % VARIANTS) ?: return
         totBusy = true
         recognize(crop) { raw ->
             totBusy = false
@@ -450,6 +442,24 @@ class StartService : AccessibilityService() {
             c.drawPath(p, solid)
         }
 
+        // Çapraz iki ok: dışa (büyüt) veya içe (küçült)
+        private fun diagArrows(c: Canvas, cx: Float, cy: Float, r: Float, outward: Boolean) {
+            val u = 0.7071f
+            for (k in intArrayOf(1, -1)) {
+                val dirx = (if (outward) k else -k) * u
+                val diry = (if (outward) -k else k) * u
+                val far = floatArrayOf(cx + k * r * 0.75f, cy - k * r * 0.75f)
+                val near = floatArrayOf(cx + k * r * 0.2f, cy - k * r * 0.2f)
+                if (outward) {
+                    c.drawLine(near[0], near[1], far[0] - dirx * r * 0.2f, far[1] - diry * r * 0.2f, line)
+                    head(c, far[0] - dirx * r * 0.2f, far[1] - diry * r * 0.2f, dirx, diry, r * 0.4f)
+                } else {
+                    c.drawLine(far[0], far[1], near[0] - dirx * r * 0.05f, near[1] - diry * r * 0.05f, line)
+                    head(c, near[0] - dirx * r * 0.05f, near[1] - diry * r * 0.05f, dirx, diry, r * 0.4f)
+                }
+            }
+        }
+
         override fun onDraw(c: Canvas) {
             val cx = width / 2f; val cy = height / 2f
             val rad = min(width, height) / 2f - dp(1)
@@ -471,6 +481,8 @@ class StartService : AccessibilityService() {
                         head(c, ex, ey, dd[0], dd[1], r * 0.35f)
                     }
                 }
+                Ic.SHRINK -> diagArrows(c, cx, cy, r, false)
+                Ic.GROW -> diagArrows(c, cx, cy, r, true)
                 Ic.PLAY -> {
                     val p = Path().apply {
                         moveTo(cx - r * 0.5f, cy - r * 0.75f)
@@ -583,16 +595,66 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // Yüksekliği ekranın %92'siyle sınırlı, sığmazsa içinde kaydırılan panel
+    // Yüksekliği ekranın %92'siyle sınırlı, sığmazsa içinde kaydırılan panel.
+    // Düğme olmayan yerden (saydam arka plan, yazılar) sürüklenince paneli taşır.
     private inner class CappedScroll(ctx: Context) : ScrollView(ctx) {
+        private var dragging = false
+        private var dx0 = 0f
+        private var dy0 = 0f
+        private var sx = 0
+        private var sy = 0
+
         override fun onMeasure(w: Int, h: Int) {
             val cap = (screenBounds().height() * 0.92f).toInt()
             super.onMeasure(w, View.MeasureSpec.makeMeasureSpec(cap, View.MeasureSpec.AT_MOST))
+        }
+
+        private fun onIcon(rx: Float, ry: Float): Boolean {
+            val loc = IntArray(2)
+            for (v in iconViews) {
+                if (!v.isShown) continue
+                v.getLocationOnScreen(loc)
+                if (rx >= loc[0] && rx <= loc[0] + v.width && ry >= loc[1] && ry <= loc[1] + v.height)
+                    return true
+            }
+            return false
+        }
+
+        override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN && !onIcon(ev.rawX, ev.rawY)) {
+                val lp = panelLp
+                if (lp != null) {
+                    dragging = true
+                    dx0 = ev.rawX; dy0 = ev.rawY; sx = lp.x; sy = lp.y
+                    return true
+                }
+            }
+            return if (dragging) true else super.onInterceptTouchEvent(ev)
+        }
+
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            if (dragging) {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_MOVE -> {
+                        val lp = panelLp
+                        if (lp != null) {
+                            val b = screenBounds()
+                            lp.x = (sx + (ev.rawX - dx0).toInt()).coerceIn(0, max(0, b.width() - width))
+                            lp.y = (sy + (ev.rawY - dy0).toInt()).coerceIn(0, max(0, b.height() - height))
+                            try { wm.updateViewLayout(this, lp) } catch (_: Exception) {}
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dragging = false
+                }
+                return true
+            }
+            return super.onTouchEvent(ev)
         }
     }
 
     private fun showPanel(px: Int, py: Int) {
         val handle = Item(Ic.MOVE, Color.parseColor("#FF9800"), Color.WHITE, 28, "Taşı")
+        val mini = Item(Ic.SHRINK, Color.parseColor("#3949AB"), Color.WHITE, 28, "Küçült")
         val main = Item(Ic.PLAY, Color.parseColor("#E53935"), Color.WHITE, 44, "Başlat")
         val calib = Item(Ic.PLUS, Color.parseColor("#1E88E5"), Color.WHITE, 28, "Yuva kaydet")
         val del = Item(Ic.MINUS, Color.parseColor("#B71C1C"), Color.WHITE, 28, "Hepsini sil")
@@ -607,7 +669,12 @@ class StartService : AccessibilityService() {
         mainItem = main
         eyeItem = hide
         totItem = tot
+        miniItem = mini
+        hideWhenMin = listOf(calib, del, undo, hide, copy, area, live, tot, save)
         hide.iv.icon = if (markersOn) Ic.EYE_ON else Ic.EYE_OFF
+        val all = listOf(handle, mini, main, calib, del, undo, hide, copy, area, live, tot, save, off)
+        iconViews.clear()
+        iconViews.addAll(all.map { it.iv })
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -617,8 +684,7 @@ class StartService : AccessibilityService() {
                 setStroke(dp(1), Color.parseColor("#66FFFFFF"))
             }
             setPadding(d(6), d(4), d(6), d(6))
-            for (item in listOf(handle, main, calib, del, undo, hide, copy, area, live, tot, save, off))
-                addView(item.col)
+            for (item in all) addView(item.col)
         }
         val root = CappedScroll(this).apply {
             addView(box)
@@ -664,6 +730,7 @@ class StartService : AccessibilityService() {
         }
 
         // Seçim (yuva / okuma alanı) sürerken panelde herhangi bir butona basmak seçimi iptal eder
+        mini.iv.setOnClickListener { if (!cancelPick()) toggleMinimize() }
         main.iv.setOnClickListener { if (!cancelPick()) toggleLoop() }
         calib.iv.setOnClickListener { if (!cancelPick()) startCalibration(nextSlot) }
         del.iv.setOnClickListener { if (!cancelPick()) clearSlots() }
@@ -682,8 +749,22 @@ class StartService : AccessibilityService() {
         panel = root
         panelLp = lp
         updateMainColor()
+        applyMinimize()
         updateTotUi()
         root.post { clampPanel() }
+    }
+
+    private fun toggleMinimize() {
+        minimized = !minimized
+        applyMinimize()
+    }
+
+    // Küçükken sadece Taşı, Büyült, Başlat ve Gizle kalır
+    private fun applyMinimize() {
+        for (it in hideWhenMin) it.col.visibility = if (minimized) View.GONE else View.VISIBLE
+        miniItem?.iv?.icon = if (minimized) Ic.GROW else Ic.SHRINK
+        miniItem?.tv?.text = if (minimized) "Büyült" else "Küçült"
+        panel?.post { panel?.requestLayout(); clampPanel() }
     }
 
     // Boyut ayarı değişince paneli aynı yerde yeniden kurar
@@ -694,10 +775,7 @@ class StartService : AccessibilityService() {
             removeView(panel); panel = null
             showPanel(x, y)
             ui.postDelayed({ clampPanel() }, 300)
-            log("Panel yeniden kuruldu (boyut x${String.format(java.util.Locale.US, "%.2f", scale())})")
-        } catch (e: Exception) {
-            log("Panel kurulamadı: ${e.javaClass.simpleName} ${e.message}")
-        }
+        } catch (_: Exception) {}
     }
 
     private fun clampPanel() {
@@ -743,12 +821,10 @@ class StartService : AccessibilityService() {
         panel?.visibility = if (v) View.VISIBLE else View.GONE
         markers?.visibility = if (v) View.VISIBLE else View.INVISIBLE
         if (v) {
-            restoreBackupIfAny()
             resetTotal()
             ensureScan()
         }
         updateTotUi()
-        log(if (v) "Panel gösterildi, toplam kupa sıfırlandı" else "Panel gizlendi, döngü durduruldu")
     }
 
     fun isPanelVisible() = panelShown
@@ -756,56 +832,6 @@ class StartService : AccessibilityService() {
     private fun hidePanel() {
         setPanelVisible(false)
         toast("Panel gizlendi. Geri açmak için uygulamadaki düğme.")
-    }
-
-    // Uygulamadan: eski yuvaları yedekler, temizler, varsayılan yerde yeni panel açar
-    fun openFresh() {
-        ui.post {
-            try {
-                cancelPick()
-                haltLoop()
-                val bk = bkPrefs()
-                if (!bk.getBoolean("has", false)) {
-                    val e = bk.edit().clear()
-                    SlotStore.copyInto(prefs.all, e)
-                    e.putBoolean("has", true).commit()
-                }
-                prefs.edit().clear().commit()
-                undoSnap = null
-                nextSlot = 1
-                markersOn = true
-                panelShown = true
-                resetTotal()
-                removeView(panel); panel = null
-                showPanel(d(8), d(24))
-                markers?.visibility = View.VISIBLE
-                refreshMarkers()
-                ensureScan()
-                log("Sıfırdan panel açıldı, eski yuvalar yedeğe alındı")
-                toast("Yeni panel açıldı. Gizle deyip uygulamadan tekrar açarsan eski yuvalar geri gelir.")
-            } catch (e: Exception) {
-                log("Sıfırdan açma hatası: ${e.javaClass.simpleName} ${e.message}")
-            }
-        }
-    }
-
-    private fun restoreBackupIfAny() {
-        val bk = bkPrefs()
-        if (!bk.getBoolean("has", false)) return
-        val b = screenBounds()
-        // Yeni panelde yapılanlar kaybolmasın: otomatik Kayıt olarak sakla
-        SlotStore.format(prefs, "${b.width()}x${b.height()}", sets)?.let {
-            val n = SlotStore.recAdd(recPrefs(), it)
-            log("Sıfırdan paneldeki yuvalar Kayıt $n olarak saklandı")
-        }
-        val e = prefs.edit().clear()
-        SlotStore.copyInto(bk.all, e, "has")
-        e.commit()
-        bk.edit().clear().commit()
-        nextSlot = 1
-        undoSnap = null
-        refreshMarkers()
-        toast("Önceki yuvalar geri geldi")
     }
 
     // Uygulamadan bir kayıt yüklenince
@@ -817,7 +843,6 @@ class StartService : AccessibilityService() {
             resetTotal()
             refreshMarkers()
             ensureScan()
-            log("Uygulamadan kayıt yüklendi")
         }
     }
 
@@ -835,8 +860,8 @@ class StartService : AccessibilityService() {
             val have = (1..SlotStore.CORE).count { slotReady(it) }
             toast("$have/${SlotStore.CORE} çekirdek yuva dolu, kaydedilmedi"); return
         }
-        val n = SlotStore.recAdd(recPrefs(), text)
-        toast("Kayıt $n kaydedildi (uygulamada Kayıtlar bölümünde)")
+        val (n, added) = SlotStore.recAddUnique(recPrefs(), text)
+        toast(if (added) "Kaydedildi (Kayıt $n)" else "Zaten kayıtlı (Kayıt $n), tekrar kaydedilmedi")
     }
 
     // --- Yuvalar ---
@@ -902,12 +927,7 @@ class StartService : AccessibilityService() {
         val g = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, TAP_MS))
             .build()
-        val now = System.currentTimeMillis()
-        lastTapMs[i] = now
-        if (i != ATTACK) {
-            lastProgressMs = now
-            log("Basıldı: $i (${SlotStore.NAMES[i]})")
-        }
+        lastTapMs[i] = System.currentTimeMillis()
         dispatchGesture(g, null, null)
     }
 
@@ -994,40 +1014,52 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // Test oku: alanı 3 farklı görüntü işlemeyle okur, çerçevede OKU (sayı) / OKU (Yok) gösterir
+    // Test oku: 4 görüntü işleme x en fazla 3 ekran görüntüsü, oy çoğunluğu; çerçevede OKU (sayı) / OKU (Yok)
     private fun liveRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
         if (running) { toast("Önce döngüyü durdur"); return }
-        withScreenshot { bmp ->
-            if (bmp == null) { showLabel("Yok"); return@withScreenshot }
-            val crops = (0..2).map { cropForOcr(bmp, it) }
-            if (crops.any { it == null }) {
-                crops.forEach { it?.recycle() }
-                showLabel("Yok"); return@withScreenshot
-            }
-            val vals = arrayOfNulls<Int>(3)
-            var left = 3
-            for (idx in 0..2) {
-                recognize(crops[idx]!!) { raw ->
-                    vals[idx] = TrophyParser.parse(raw)
-                    left--
-                    if (left == 0) {
-                        val found = vals.filterNotNull()
-                        val best = found.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
-                        showLabel(best?.toString() ?: "Yok")
+        if (liveBusy) return
+        liveBusy = true
+        val votes = ArrayList<Int>()
+
+        fun finish() {
+            liveBusy = false
+            val best = votes.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
+            showLabel(best?.toString() ?: "Yok")
+        }
+
+        fun round(n: Int) {
+            withScreenshot { bmp ->
+                if (bmp == null) {
+                    if (n < 2) ui.postDelayed({ round(n + 1) }, 400) else finish()
+                    return@withScreenshot
+                }
+                val crops = (0 until VARIANTS).mapNotNull { cropForOcr(bmp, it) }
+                if (crops.isEmpty()) { finish(); return@withScreenshot }
+                var left = crops.size
+                for (cr in crops) {
+                    recognize(cr) { raw ->
+                        TrophyParser.parse(raw)?.let { votes.add(it) }
+                        left--
+                        if (left == 0) {
+                            val top = votes.groupingBy { it }.eachCount().maxOfOrNull { it.value } ?: 0
+                            if (top >= 2 || n >= 2) finish()
+                            else ui.postDelayed({ round(n + 1) }, 350)
+                        }
                     }
                 }
             }
         }
+        round(0)
     }
 
-    // Alan seç butonuna uzun basış: 3 görüntü işlemenin ham sonuçlarını gösterir
+    // Alan seç butonuna uzun basış: görüntü işlemelerin ham sonuçlarını gösterir
     private fun testRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
         if (running) { toast("Önce döngüyü durdur"); return }
         withScreenshot { bmp ->
             if (bmp == null) { toast("Ekran alınamadı"); return@withScreenshot }
-            for (v in 0..2) {
+            for (v in 0 until VARIANTS) {
                 val crop = cropForOcr(bmp, v)
                 if (crop == null) { toast("Okuma alanı geçersiz"); return@withScreenshot }
                 recognize(crop) { raw ->
@@ -1043,6 +1075,7 @@ class StartService : AccessibilityService() {
 
     private fun resetState() {
         streak.fill(0)
+        endStreak.fill(0)
         inMatch = false; hitStreak = 0
         phase = Phase.LOOP; needCheck = false; afterSwitch = false
         ocrBusy = false; switchArmed = false; failCycles = 0
@@ -1052,6 +1085,7 @@ class StartService : AccessibilityService() {
     private fun haltLoop() {
         running = false
         session++
+        switchToken++
         resetState()
         updateMainColor()
         setKeepAwake(false)
@@ -1079,9 +1113,6 @@ class StartService : AccessibilityService() {
             resetState()
             needCheck = true            // ilk Oyna'dan önce kupayı oku
             running = true
-            val now = System.currentTimeMillis()
-            lastProgressMs = now
-            pkgSince = now
             setKeepAwake(true)
             ensureScan()
             if (!combatRunning) { combatRunning = true; nextTapAt = 0L; ui.post(combatTick) }
@@ -1105,22 +1136,8 @@ class StartService : AccessibilityService() {
     private val scanTick = object : Runnable {
         override fun run() {
             if (!running && !totalActive()) { scanRunning = false; return }
-            val now = System.currentTimeMillis()
-            var pkg = lastPkg
-            if (pkg != null && pkg != GAME_PKG && now - pkgSince > FOREIGN_PKG_MS) {
-                log("Başka uygulama ($pkg) ${FOREIGN_PKG_MS / 1000} sn görünüyor: oyunda sayılıyor")
-                lastPkg = null; pkg = null
-            }
-            if (running && now - lastProgressMs > STUCK_MS) {
-                log("TAKILDI? faz=$phase maçta=$inMatch pkg=$lastPkg ekranHata=$shotFails kontrolGerek=$needCheck")
-                lastProgressMs = now
-            }
-            val gameFront = pkg == null || pkg == GAME_PKG
-            if (gameFront && calibLayer == null) {
+            if (calibLayer == null) {
                 withScreenshot { bmp -> if (bmp != null) evaluate(bmp) }
-            } else if (running) {
-                streak.fill(0)
-                inMatch = false; hitStreak = 0
             }
             ui.postDelayed(this, SCAN_PERIOD_MS)
         }
@@ -1142,10 +1159,10 @@ class StartService : AccessibilityService() {
         }
     }
 
-    private fun hit(i: Int, bmp: Bitmap): Boolean {
+    private fun hit(i: Int, bmp: Bitmap, tol: Int = COLOR_TOLERANCE): Boolean {
         if (!slotReady(i)) return false
         val c = sampleColor(bmp, prefs.getFloat("x$i", 0f), prefs.getFloat("y$i", 0f)) ?: return false
-        return close(c, prefs.getInt("c$i", 0))
+        return close(c, prefs.getInt("c$i", 0), tol)
     }
 
     // Saldırı düğmesi: tam renk VEYA aynı tonun koyu/açık hali (basılı görünüm)
@@ -1153,7 +1170,7 @@ class StartService : AccessibilityService() {
         if (!slotReady(ATTACK)) return false
         val c = sampleColor(bmp, prefs.getFloat("x$ATTACK", 0f), prefs.getFloat("y$ATTACK", 0f)) ?: return false
         val ref = prefs.getInt("c$ATTACK", 0)
-        if (close(c, ref)) return true
+        if (close(c, ref, COLOR_TOLERANCE)) return true
         val hc = FloatArray(3); val hr = FloatArray(3)
         Color.colorToHSV(c, hc); Color.colorToHSV(ref, hr)
         if (hr[1] < 0.2f) return hc[1] < 0.3f && abs(hc[2] - hr[2]) < 0.3f
@@ -1163,43 +1180,44 @@ class StartService : AccessibilityService() {
             hc[2] >= hr[2] * 0.55f && hc[2] <= hr[2] * 1.35f + 0.05f
     }
 
-    // Maça girmek için saldırı düğmesi 2 taramada görünmeli. Maçtan çıkış: maç sonu düğmesi
-    // (evaluate içinde) veya düğme DEAD_HOLD_MS boyunca hiç görünmezse.
-    private fun updateGate(bmp: Bitmap, now: Long) {
-        if (!slotReady(ATTACK)) { inMatch = false; hitStreak = 0; return }
-        if (attackMatch(bmp)) { hitStreak++; lastAttackSeenMs = now } else hitStreak = 0
-        if (!inMatch && hitStreak >= ENTER_HITS) inMatch = true
-        if (inMatch && now - lastAttackSeenMs > DEAD_HOLD_MS) {
-            inMatch = false
-            log("Saldırı düğmesi ${DEAD_HOLD_MS / 1000} sn görünmedi: maç dışı sayıldı")
-        }
-    }
-
     private fun evaluate(bmp: Bitmap) {
         val now = System.currentTimeMillis()
         if (totalActive()) readTotal(bmp)
         if (!running) return
         lastGateMs = now
-        when (phase) {
-            Phase.LOOP -> {
-                // Menü düğmeleri maç sırasında da izlenir: biri üst üste görünürse maç bitmiştir
-                for (i in MENU_SLOTS) streak[i] = if (hit(i, bmp)) streak[i] + 1 else 0
-                val endSeen = MENU_SLOTS.any { streak[it] >= CONFIRM_SCANS }
-                val was = inMatch
-                if (endSeen) {
-                    inMatch = false; hitStreak = 0
-                } else {
-                    updateGate(bmp, now)
-                }
-                if (inMatch != was) {
-                    lastProgressMs = now
-                    log(if (inMatch) "Maç başladı" else "Maç bitti")
-                    if (inMatch) needCheck = true   // maçtan sonraki ilk Oyna'dan önce kupa okunacak
-                }
-                if (inMatch) return
-                loopStep(now)
+
+        for (i in MENU_SLOTS) streak[i] = if (hit(i, bmp)) streak[i] + 1 else 0
+        val atk = attackMatch(bmp)
+        if (atk) { hitStreak++; lastAttackSeenMs = now } else hitStreak = 0
+
+        // Saldırı düğmesi yalnızca maçta vardır: okuma/değiştirme sırasında görünürse bunlar iptal edilir
+        if (hitStreak >= ABORT_ATTACK_SCANS && phase != Phase.LOOP) {
+            phase = Phase.LOOP
+            ocrBusy = false; switchArmed = false; afterSwitch = false
+            switchToken++
+            reads.clear()
+            inMatch = true
+            needCheck = true
+        }
+        if (hitStreak >= ENTER_HITS && !inMatch && phase == Phase.LOOP) {
+            inMatch = true
+            needCheck = true            // maçtan sonraki ilk Oyna'dan önce kupa okunacak
+        }
+
+        if (phase == Phase.LOOP && inMatch) {
+            // Maç sonu: saldırı düğmesi görünmüyorken, sıkı renkle, üst üste END_SCANS taramada
+            if (atk) endStreak.fill(0)
+            else for (i in MENU_SLOTS) endStreak[i] = if (hit(i, bmp, END_TOL)) endStreak[i] + 1 else 0
+            if (MENU_SLOTS.any { endStreak[it] >= END_SCANS }) {
+                inMatch = false; hitStreak = 0; endStreak.fill(0)
+            } else if (now - lastAttackSeenMs > DEAD_HOLD_MS) {
+                inMatch = false
             }
-            // Okuma ve karakter değiştirme sırasında maç kapısı çalışmaz, faz sıfırlanmaz
+            if (inMatch) return
+        }
+
+        when (phase) {
+            Phase.LOOP -> loopStep(now)
             Phase.READING -> readStep(bmp, now)
             Phase.SWITCH -> switchStep(bmp, now)
         }
@@ -1229,7 +1247,6 @@ class StartService : AccessibilityService() {
         ocrBusy = false
         readStartMs = at
         settleUntil = at
-        log("Kupa okuması başladı")
     }
 
     private fun readStep(bmp: Bitmap, now: Long) {
@@ -1237,7 +1254,7 @@ class StartService : AccessibilityService() {
         if (now - readStartMs > READ_TIMEOUT_MS) { readFailed("Okuma zaman aşımı"); return }
         if (ocrBusy) return
         if (!hit(PLAY, bmp)) return          // lobi görünmüyorsa okuma
-        val crop = cropForOcr(bmp, readAttempts % 3)
+        val crop = cropForOcr(bmp, readAttempts % VARIANTS)
         if (crop == null) { stopAll("Okuma alanı geçersiz: sistem durdu"); return }
         ocrBusy = true
         val s = session
@@ -1329,7 +1346,7 @@ class StartService : AccessibilityService() {
 
     private fun cropForOcr(bmp: Bitmap, variant: Int): Bitmap? = cropRect(bmp, "o", variant)
 
-    // variant 0: normal, 1: kontrastlı gri, 2: kontrastlı gri ters çevrilmiş
+    // variant 0: normal, 1: kontrastlı gri, 2: kontrastlı gri ters, 3: sadece ters renk
     private fun cropRect(bmp: Bitmap, p: String, variant: Int): Bitmap? {
         val ok = if (p == "o") SlotStore.rectReady(prefs) else SlotStore.totReady(prefs)
         if (!ok) return null
@@ -1348,23 +1365,37 @@ class StartService : AccessibilityService() {
                 if (scaled !== crop) crop.recycle()
                 scaled
             }
-            styleVariant(sized, variant)
+            styleVariant(padBitmap(sized), variant)
         } catch (_: Exception) { null }
+    }
+
+    // Yazıyı çerçeveye yapışık bırakmamak için etrafına arka plan renginde boşluk ekler
+    private fun padBitmap(src: Bitmap): Bitmap {
+        val pad = max(8, src.height / 3)
+        val out = Bitmap.createBitmap(src.width + 2 * pad, src.height + 2 * pad, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(out)
+        cv.drawColor(src.getPixel(1, 1))
+        cv.drawBitmap(src, pad.toFloat(), pad.toFloat(), null)
+        src.recycle()
+        return out
     }
 
     private fun styleVariant(src: Bitmap, variant: Int): Bitmap {
         if (variant == 0) return src
         val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
-        val cm = ColorMatrix().apply { setSaturation(0f) }
-        val k = 2.2f
-        val off = -128f * (k - 1f)
-        cm.postConcat(ColorMatrix(floatArrayOf(
-            k, 0f, 0f, 0f, off,
-            0f, k, 0f, 0f, off,
-            0f, 0f, k, 0f, off,
-            0f, 0f, 0f, 1f, 0f
-        )))
-        if (variant == 2) {
+        val cm = ColorMatrix()
+        if (variant != 3) {
+            cm.setSaturation(0f)
+            val k = 2.2f
+            val off = -128f * (k - 1f)
+            cm.postConcat(ColorMatrix(floatArrayOf(
+                k, 0f, 0f, 0f, off,
+                0f, k, 0f, 0f, off,
+                0f, 0f, k, 0f, off,
+                0f, 0f, 0f, 1f, 0f
+            )))
+        }
+        if (variant == 2 || variant == 3) {
             cm.postConcat(ColorMatrix(floatArrayOf(
                 -1f, 0f, 0f, 0f, 255f,
                 0f, -1f, 0f, 0f, 255f,
@@ -1390,10 +1421,10 @@ class StartService : AccessibilityService() {
         }
     }
 
-    private fun close(a: Int, b: Int) =
-        abs(Color.red(a) - Color.red(b)) <= COLOR_TOLERANCE &&
-        abs(Color.green(a) - Color.green(b)) <= COLOR_TOLERANCE &&
-        abs(Color.blue(a) - Color.blue(b)) <= COLOR_TOLERANCE
+    private fun close(a: Int, b: Int, tol: Int) =
+        abs(Color.red(a) - Color.red(b)) <= tol &&
+        abs(Color.green(a) - Color.green(b)) <= tol &&
+        abs(Color.blue(a) - Color.blue(b)) <= tol
 
     private fun sampleColor(bmp: Bitmap, fx: Float, fy: Float): Int? {
         val cx = (fx * bmp.width).toInt()
@@ -1425,22 +1456,17 @@ class StartService : AccessibilityService() {
                         result.hardwareBuffer.close()
                         shotBusy = false
                     }
-                    shotFails = 0
                     try { done(bmp) } finally { bmp?.recycle() }
                 }
 
                 override fun onFailure(errorCode: Int) {
                     shotBusy = false
-                    shotFails++
-                    if (shotFails == 3 || shotFails % 30 == 0)
-                        log("Ekran görüntüsü hatası kod=$errorCode (üst üste $shotFails)")
                     done(null)
                 }
             })
     }
 
     private fun toast(s: String) {
-        log(s)
         ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
     }
 }
