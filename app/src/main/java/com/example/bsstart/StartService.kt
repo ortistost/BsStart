@@ -105,11 +105,11 @@ class StartService : AccessibilityService() {
         reads.clear()
     }
 
-    // Son 12 okuma satırı, uygulamadaki "Son okumalar" bölümünde görünür
+    // Son 40 okuma satırı, uygulamadaki "Son okumalar" bölümünde görünür
     private fun logRead(m: String) {
         try {
             val old = stat.getString("reads", "") ?: ""
-            val lines = (old.split("\n").filter { it.isNotEmpty() } + "${stamp()} $m").takeLast(12)
+            val lines = (old.split("\n").filter { it.isNotEmpty() } + "${stamp()} $m").takeLast(40)
             stat.edit().putString("reads", lines.joinToString("\n")).apply()
         } catch (_: Exception) {}
     }
@@ -1788,6 +1788,27 @@ class StartService : AccessibilityService() {
         note("Maç başladı")
     }
 
+    private var lastDiagMs = 0L
+
+    private fun hexOf(c: Int?) = if (c == null) "-" else String.format("#%06X", c and 0xFFFFFF)
+
+    // Takılma teşhisi: lobide beklerken 8 sn'de bir yuvaların beklenen ve okunan rengini yazar
+    private fun diag(bmp: Bitmap, now: Long) {
+        if (now - lastDiagMs < 8000L) return
+        lastDiagMs = now
+        val sb = StringBuilder("teşhis faz=$phase needCheck=$needCheck afterSwitch=$afterSwitch")
+        val slots = if (phase == Phase.SWITCH) intArrayOf(BRAWLERS) else intArrayOf(PLAY, 3, 4, 5)
+        for (i in slots) {
+            if (!slotReady(i)) { sb.append(" | $i yok"); continue }
+            val cur = sampleColor(bmp, prefs.getFloat("x$i", 0f), prefs.getFloat("y$i", 0f))
+            sb.append(" | $i ${hexOf(cur)}/${hexOf(prefs.getInt("c$i", 0))} ")
+            sb.append(if (hit(i, bmp)) "UYUYOR" else "uymuyor")
+            sb.append(" seri=${streak[i]}")
+        }
+        sb.append(" | üst=${trophyUpper ?: "-"} alt=${trophyLow ?: "-"}")
+        logRead(sb.toString())
+    }
+
     private fun evaluate(bmp: Bitmap) {
         val now = System.currentTimeMillis()
         if (totalActive()) readTotal(bmp)
@@ -1840,6 +1861,7 @@ class StartService : AccessibilityService() {
             if (inMatch) return
         }
 
+        diag(bmp, now)
         when (phase) {
             Phase.LOOP -> loopStep(now)
             Phase.READING -> readStep(bmp, now)
