@@ -21,6 +21,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -43,14 +44,13 @@ class MainActivity : Activity() {
     private lateinit var statusTv: TextView
     private lateinit var eventTv: TextView
     private lateinit var stopTv: TextView
-    private lateinit var autoTv: TextView
-    private lateinit var autoInfo: TextView
-    private lateinit var autoBtn: Button
     private lateinit var readsTv: TextView
+    private lateinit var recHead: TextView
     private lateinit var recBox: LinearLayout
     private lateinit var limitEt: EditText
     private lateinit var scaleEt: EditText
-    private lateinit var runBtn: Button
+    private lateinit var rateEt: EditText
+    private lateinit var aifEt: EditText
     private val checks = ArrayList<Pair<String, CheckBox>>()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -129,37 +129,6 @@ class MainActivity : Activity() {
         say("Kopyalandı")
     }
 
-    private fun autoOn() = SlotStore.autoTrophy(setPrefs(), cfg())
-
-    private fun refreshAuto() {
-        val on = autoOn()
-        val lim = setPrefs().getInt("limit", SlotStore.DEFAULT_LIMIT)
-        autoTv.text = "Otomatik kupa: " + if (on) "AÇIK" else "kapalı"
-        autoTv.setTextColor(if (on) Color.parseColor("#00E676") else Color.WHITE)
-        autoBtn.text = if (on) "Kapat" else "Aç"
-        autoBtn.background = shape(if (on) DANGER else GREEN, 12)
-        autoInfo.text = if (on)
-            "Karakter kupası $lim ve üstüne çıkınca Savaşçılar → Karakter → Seç yapılır. ${lim - 1} ve altında karakter değişmez."
-        else
-            "Kapalıyken karakter hiç değişmez, sadece maç döngüsü çalışır."
-    }
-
-    private fun toggleAuto() {
-        val sp = setPrefs()
-        if (autoOn()) {
-            sp.edit().putBoolean("atrophy", false).apply()
-            say("Otomatik kupa kapatıldı")
-        } else {
-            val parsed = SlotStore.parse(SlotStore.PRESET).parsed
-            val n = if (parsed != null) SlotStore.fillMissing(cfg(), parsed, sp) else 0
-            sp.edit().putBoolean("atrophy", true).apply()
-            if (n > 0) ServiceBridge.service?.onExternalLoad()
-            syncFields()
-            say(if (n > 0) "Otomatik kupa açıldı, hazır ayardan $n öğe eklendi" else "Otomatik kupa açıldı")
-        }
-        refreshAuto()
-    }
-
     private fun loadPreset() {
         AlertDialog.Builder(this)
             .setTitle("Hazır ayarı baştan yükle")
@@ -168,11 +137,9 @@ class MainActivity : Activity() {
                 val parsed = SlotStore.parse(SlotStore.PRESET).parsed
                 if (parsed == null) { say("Hazır ayar okunamadı"); return@setPositiveButton }
                 SlotStore.apply(cfg(), parsed, setPrefs())
-                setPrefs().edit().putBoolean("atrophy", true).apply()
                 ServiceBridge.service?.onExternalLoad()
                 syncFields()
-                refreshAuto()
-                say("Hazır ayar yüklendi, otomatik kupa açık")
+                say("Hazır ayar yüklendi")
             }
             .setNegativeButton("İptal", null)
             .show()
@@ -188,7 +155,6 @@ class MainActivity : Activity() {
         statusTv.setTextColor(
             if (s == null) Color.parseColor("#FF5252") else Color.parseColor("#00E676")
         )
-        runBtn.text = if (s != null && s.isRunning()) "Döngüyü durdur" else "Döngüyü başlat"
         val st = getSharedPreferences("bsstat", MODE_PRIVATE)
         eventTv.text = "Son olay: " + (st.getString("ev", null) ?: "-")
         stopTv.text = "Son durma sebebi: " + (st.getString("stop", null) ?: "-")
@@ -203,7 +169,6 @@ class MainActivity : Activity() {
         val ok = SlotStore.apply(cfg(), p, setPrefs())
         ServiceBridge.service?.onExternalLoad()
         syncFields()
-        refreshAuto()
         say(if (ok) "Yüklendi" else "Yükleme başarısız")
         refreshStatus()
     }
@@ -228,6 +193,7 @@ class MainActivity : Activity() {
     private fun refreshRecords() {
         recBox.removeAllViews()
         val list = SlotStore.recList(recPrefs())
+        recHead.text = "KAYITLAR (${list.size}/${SlotStore.MAX_RECORDS})"
         if (list.isEmpty()) {
             recBox.addView(body("Kayıt yok. Panelde Kaydet düğmesine bas.", 13f, SUB))
             return
@@ -256,6 +222,13 @@ class MainActivity : Activity() {
         val cur = scaleEt.text.toString().replace(',', '.').toFloatOrNull()
         if (cur == null || Math.abs(cur - scv) > 0.004f)
             scaleEt.setText(String.format(Locale.US, "%.2f", scv))
+        val rv = sp.getFloat("atkrate", SlotStore.DEFAULT_ATK_RATE)
+            .coerceIn(SlotStore.MIN_ATK_RATE, SlotStore.MAX_ATK_RATE)
+        val rcur = rateEt.text.toString().replace(',', '.').toFloatOrNull()
+        if (rcur == null || Math.abs(rcur - rv) > 0.004f)
+            rateEt.setText(String.format(Locale.US, "%.2f", rv))
+        val av = sp.getInt("aifpct", SlotStore.DEFAULT_AIF).coerceIn(SlotStore.MIN_AIF, SlotStore.MAX_AIF)
+        if (aifEt.text.toString() != av.toString()) aifEt.setText(av.toString())
         for ((k, cb) in checks) {
             val on = SlotStore.btnOn(sp, k)
             if (cb.isChecked != on) cb.isChecked = on
@@ -267,7 +240,6 @@ class MainActivity : Activity() {
         refreshStatus()
         refreshRecords()
         syncFields()
-        refreshAuto()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -303,13 +275,6 @@ class MainActivity : Activity() {
         eventTv = body("", 12f, SUB).apply { setPadding(0, dp(6), 0, 0) }
         stopTv = body("", 12f, SUB).apply { setPadding(0, dp(2), 0, 0) }
         st.addView(statusTv); st.addView(eventTv); st.addView(stopTv)
-        runBtn = btn("Döngüyü başlat", GREEN) {
-            val s = ServiceBridge.service
-            if (s == null) say("Servis kapalı, önce erişilebilirliği aç")
-            else s.toggleLoopExternal()
-            h.postDelayed({ refreshStatus() }, 400)
-        }
-        st.addView(runBtn)
         st.addView(btn("Paneli göster / gizle") {
             val s = ServiceBridge.service
             if (s == null) say("Servis kapalı, önce erişilebilirliği aç")
@@ -326,28 +291,11 @@ class MainActivity : Activity() {
         })
         col.addView(st)
 
-        // Otomatik kupa
-        val ac = card()
-        ac.addView(heading("OTOMATİK KUPA"))
-        val arow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-            layoutParams = lp(8)
-        }
-        autoTv = body("Otomatik kupa", 15f).apply {
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        autoBtn = Button(this).apply {
-            isAllCaps = false; setTextColor(Color.WHITE); textSize = 14f
-            layoutParams = LinearLayout.LayoutParams(dp(96), dp(44))
-            setOnClickListener { toggleAuto() }
-        }
-        arow.addView(autoTv); arow.addView(autoBtn)
-        ac.addView(arow)
-        autoInfo = body("", 12f, SUB).apply { setPadding(0, dp(8), 0, 0) }
-        ac.addView(autoInfo)
-        ac.addView(btn("Hazır ayarı baştan yükle", GREY) { loadPreset() })
-        col.addView(ac)
+        // Hazır ayar
+        val pc = card()
+        pc.addView(heading("HAZIR AYAR"))
+        pc.addView(btn("Hazır ayarı baştan yükle", GREY) { loadPreset() })
+        col.addView(pc)
 
         // Ayarlar
         val sc = card()
@@ -372,11 +320,10 @@ class MainActivity : Activity() {
             } else {
                 if (sp.getInt("limit", -1) != v) sp.edit().putInt("limit", v).apply()
                 showLimit()
-                refreshAuto()
             }
         }
 
-        sc.addView(body("Panel boyutu (0.6-1.25)", 14f).apply { setPadding(0, dp(14), 0, 0) })
+        sc.addView(body("Panel boyutu (0.5-1.5)", 14f).apply { setPadding(0, dp(14), 0, 0) })
         scaleEt = field("1.00", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL).apply {
             setText(String.format(Locale.US, "%.2f",
                 sp.getFloat("scale", 1f).coerceIn(SlotStore.MIN_SCALE, SlotStore.MAX_SCALE)))
@@ -387,11 +334,50 @@ class MainActivity : Activity() {
         watch(scaleEt) { t ->
             val v = t.trim().replace(',', '.').toFloatOrNull()
             if (v == null || v < SlotStore.MIN_SCALE || v > SlotStore.MAX_SCALE) {
-                scaleErr.text = "0.6 ile 1.25 arasında bir sayı gir"
+                scaleErr.text = "0.5 ile 1.5 arasında bir sayı gir"
             } else {
                 scaleErr.text = ""
                 val r = Math.round(v * 100f) / 100f
                 if (Math.abs(sp.getFloat("scale", 1f) - r) > 0.001f) sp.edit().putFloat("scale", r).apply()
+            }
+        }
+
+        sc.addView(body("Saldırı basışı (saniyede, 0.3-10)", 14f).apply { setPadding(0, dp(14), 0, 0) })
+        rateEt = field("3", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL).apply {
+            setText(String.format(Locale.US, "%.2f",
+                sp.getFloat("atkrate", SlotStore.DEFAULT_ATK_RATE)
+                    .coerceIn(SlotStore.MIN_ATK_RATE, SlotStore.MAX_ATK_RATE)))
+        }
+        sc.addView(rateEt)
+        val rateErr = body("", 12f, Color.parseColor("#FF5252")).apply { setPadding(0, dp(6), 0, 0) }
+        sc.addView(rateErr)
+        watch(rateEt) { t ->
+            val v = t.trim().replace(',', '.').toFloatOrNull()
+            if (v == null || v < SlotStore.MIN_ATK_RATE || v > SlotStore.MAX_ATK_RATE) {
+                rateErr.text = "0.3 ile 10 arasında bir sayı gir"
+            } else {
+                rateErr.text = ""
+                val r = Math.round(v * 100f) / 100f
+                if (Math.abs(sp.getFloat("atkrate", SlotStore.DEFAULT_ATK_RATE) - r) > 0.001f)
+                    sp.edit().putFloat("atkrate", r).apply()
+            }
+        }
+
+        sc.addView(body("if% eşleşme eşiği (%25-%100)", 14f).apply { setPadding(0, dp(14), 0, 0) })
+        aifEt = field("90", InputType.TYPE_CLASS_NUMBER).apply {
+            setText(sp.getInt("aifpct", SlotStore.DEFAULT_AIF)
+                .coerceIn(SlotStore.MIN_AIF, SlotStore.MAX_AIF).toString())
+        }
+        sc.addView(aifEt)
+        val aifErr = body("", 12f, Color.parseColor("#FF5252")).apply { setPadding(0, dp(6), 0, 0) }
+        sc.addView(aifErr)
+        watch(aifEt) { t ->
+            val v = t.trim().toIntOrNull()
+            if (v == null || v < SlotStore.MIN_AIF || v > SlotStore.MAX_AIF) {
+                aifErr.text = "${SlotStore.MIN_AIF} ile ${SlotStore.MAX_AIF} arasında bir sayı gir"
+            } else {
+                aifErr.text = ""
+                if (sp.getInt("aifpct", -1) != v) sp.edit().putInt("aifpct", v).apply()
             }
         }
         col.addView(sc)
@@ -437,22 +423,19 @@ class MainActivity : Activity() {
         // Kupa tablosu
         val tb = card()
         tb.addView(heading("KUPA TABLOSU"))
-        tb.addView(TextView(this).apply {
-            typeface = Typeface.MONOSPACE; textSize = 13f; setTextColor(Color.WHITE)
+        tb.addView(HorizontalScrollView(this).apply {
             setPadding(0, dp(8), 0, 0)
-            text = "Kupa        Kazanma   Kaybetme\n" +
-                "0–49        +10       0\n" +
-                "50–299      +10       −1\n" +
-                "300–599     +10       −2\n" +
-                "600–799     +10       −3\n" +
-                "800–999     +10       −4\n" +
-                "1000-1099   +10       −5"
+            addView(TextView(this@MainActivity).apply {
+                typeface = Typeface.MONOSPACE; textSize = 11f; setTextColor(Color.WHITE)
+                text = TrophyTable.asText()
+            })
         })
         col.addView(tb)
 
         // Kayıtlar
         val rc = card()
-        rc.addView(heading("KAYITLAR"))
+        recHead = heading("KAYITLAR (0/${SlotStore.MAX_RECORDS})")
+        rc.addView(recHead)
         recBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         rc.addView(recBox)
         col.addView(rc)
