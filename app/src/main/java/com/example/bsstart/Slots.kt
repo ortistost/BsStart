@@ -25,7 +25,7 @@ object SlotStore {
         "move" to "Taşı", "mini" to "Küçült / Büyült", "main" to "Başlat / Durdur",
         "calib" to "Yuva kaydet", "if" to "If", "del" to "Hepsini sil", "undo" to "Geri al",
         "eye" to "Halkalar", "area" to "Alan seç", "live" to "Test oku",
-        "tot" to "Toplam", "save" to "Kaydet", "off" to "Gizle"
+        "tot" to "Toplam", "save" to "Kaydet", "colors" to "Renkler", "off" to "Gizle"
     )
 
     fun btnOn(sets: SharedPreferences, key: String) = sets.getBoolean("btn_$key", true)
