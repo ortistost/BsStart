@@ -7,7 +7,6 @@ object SlotStore {
     const val PREFS = "cfg3"
     const val SET = "bsset"
     const val REC = "bsrec"
-    const val BACKUP = "bsbackup"
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
     const val MAX_LIMIT = 3000
@@ -29,21 +28,6 @@ object SlotStore {
 
     fun totReady(p: SharedPreferences) =
         listOf("tx1", "ty1", "tx2", "ty2").all { p.contains(it) }
-
-    // Haritadaki her kaydı editöre kopyalar
-    fun copyInto(m: Map<String, *>, e: SharedPreferences.Editor, skip: String? = null) {
-        for ((k, v) in m) {
-            if (k == skip) continue
-            when (v) {
-                is Float -> e.putFloat(k, v)
-                is Int -> e.putInt(k, v)
-                is Long -> e.putLong(k, v)
-                is Boolean -> e.putBoolean(k, v)
-                is String -> e.putString(k, v)
-                else -> {}
-            }
-        }
-    }
 
     // Çekirdek 5 yuva dolu değilse null. Dolu olan 6-8, OCR, TOT alanları ve (verilirse) ayarlar eklenir.
     fun format(p: SharedPreferences, screen: String, sets: SharedPreferences? = null): String? {
@@ -114,6 +98,12 @@ object SlotStore {
         if (v.any { it !in 0f..1f } || v[2] <= v[0] || v[3] <= v[1]) return null
         return v
     }
+
+    // Karşılaştırma için metni normalleştirir
+    fun norm(s: String) =
+        s.replace("\r", "").lines().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("===") }
+            .joinToString("\n").lowercase(Locale.ROOT)
 
     // Birden çok kayıt yapıştırılmışsa başlık satırlarından böler; "===" satırları yok sayılır
     fun splitBlocks(text: String): List<String> {
@@ -213,7 +203,7 @@ object SlotStore {
         return ok
     }
 
-    // --- Kayıtlar (Kayıt 1, Kayıt 2, ...) ---
+    // --- Kayıtlar (r1, r2, ... metin; n1, n2, ... isim) ---
 
     fun recList(r: SharedPreferences): List<Pair<Int, String>> =
         r.all.entries.mapNotNull { e ->
@@ -224,14 +214,26 @@ object SlotStore {
             else null
         }.sortedBy { it.first }
 
-    fun recAdd(r: SharedPreferences, text: String): Int {
+    // Aynı içerik zaten varsa eklemez. (kayıt no, eklendi mi)
+    fun recAddUnique(r: SharedPreferences, text: String): Pair<Int, Boolean> {
+        val want = norm(text)
+        recList(r).firstOrNull { norm(it.second) == want }?.let { return it.first to false }
         val n = r.getInt("next", 1)
         r.edit().putString("r$n", text).putInt("next", n + 1).commit()
-        return n
+        return n to true
     }
 
     fun recDelete(r: SharedPreferences, n: Int) {
-        r.edit().remove("r$n").commit()
+        r.edit().remove("r$n").remove("n$n").commit()
+    }
+
+    fun recName(r: SharedPreferences, n: Int): String? =
+        r.getString("n$n", null)?.takeIf { it.isNotEmpty() }
+
+    fun recSetName(r: SharedPreferences, n: Int, name: String) {
+        val e = r.edit()
+        if (name.isEmpty()) e.remove("n$n") else e.putString("n$n", name)
+        e.commit()
     }
 }
 
