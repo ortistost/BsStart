@@ -21,6 +21,23 @@ object SlotStore {
         "Savaşçılar", "Karakter", "Seç", "", "",
         "if (1)", "if (2)", "if (3)", "if (4)", "if (5)", "if (6)", "if (7)", "if (8)"
     )
+    // Uygulamanın hazır ayarı. Kaynak: kullanıcının kendi kaydı, screen=2340x1080.
+    // Konumlar ekran oranı olduğundan başka çözünürlükte aynı yere denk gelir; renkler cihaza özgüdür.
+    val PRESET = listOf(
+        "$HEADER screen=2340x1080",
+        "1 Maça gir x=0.8645 y=0.8954 color=#D9D8D2",
+        "2 Saldırı x=0.8543 y=0.6565 color=#B3391B",
+        "3 Devam 1 x=0.9628 y=0.9194 color=#2373FF",
+        "4 Devam 2 x=0.9521 y=0.9259 color=#2373FF",
+        "5 Çıkış x=0.9603 y=0.9231 color=#2373FF",
+        "6 Savaşçılar x=0.1013 y=0.4435 color=#353C52",
+        "7 Karakter x=0.3128 y=0.2315 color=#B116EC",
+        "8 Seç x=0.0902 y=0.8815 color=#EFC609",
+        "12 if (2) x=0.0410 y=0.0593 color=#08105E",
+        "OCR x1=0.4064 y1=0.1269 x2=0.6338 y2=0.2269",
+        "SET limit=475 scale=1.00 tot=1"
+    ).joinToString("\n")
+
     val BUTTONS = listOf(
         "move" to "Taşı", "mini" to "Küçült / Büyült", "main" to "Başlat / Durdur",
         "calib" to "Yuva kaydet", "if" to "If", "del" to "Hepsini sil", "undo" to "Geri al",
@@ -29,6 +46,10 @@ object SlotStore {
     )
 
     fun btnOn(sets: SharedPreferences, key: String) = sets.getBoolean("btn_$key", true)
+
+    // Otomatik kupa anahtarı. Hiç ayarlanmadıysa okuma alanı varsa açık sayılır (eski davranış).
+    fun autoTrophy(sets: SharedPreferences, p: SharedPreferences) =
+        if (sets.contains("atrophy")) sets.getBoolean("atrophy", false) else rectReady(p)
 
     fun ready(p: SharedPreferences, i: Int) =
         p.contains("c$i") && p.getFloat("x$i", -1f) >= 0f
@@ -195,6 +216,49 @@ object SlotStore {
                 .putBoolean("ttot", st.third).commit() && ok
         }
         return ok
+    }
+
+    // Hazır ayardan yalnızca eksik olanları doldurur, var olan hiçbir değeri ezmez.
+    // Hiç temel yuva yoksa hepsini alır; varsa sadece kupa kısmını (yuva 6-8, okuma alanı, ayarlar).
+    // Doldurulan öğe sayısını döndürür.
+    fun fillMissing(p: SharedPreferences, d: Parsed, sets: SharedPreferences?): Int {
+        val trophyOnly = coreReady(p)
+        val e = p.edit()
+        var n = 0
+        for (i in 1..SLOTS) {
+            if (!d.have[i] || ready(p, i)) continue
+            if (trophyOnly && i !in 6..8) continue
+            e.putFloat("x$i", d.xs[i]).putFloat("y$i", d.ys[i]).putInt("c$i", d.colors[i])
+            n++
+        }
+        d.rect?.let {
+            if (!rectReady(p)) {
+                e.putFloat("ox1", it[0]).putFloat("oy1", it[1])
+                    .putFloat("ox2", it[2]).putFloat("oy2", it[3])
+                n++
+            }
+        }
+        if (!trophyOnly) {
+            d.tot?.let {
+                if (!totReady(p)) {
+                    e.putFloat("tx1", it[0]).putFloat("ty1", it[1])
+                        .putFloat("tx2", it[2]).putFloat("ty2", it[3])
+                    n++
+                }
+            }
+        }
+        if (n > 0) e.commit()
+        val st = d.set
+        if (st != null && sets != null) {
+            val se = sets.edit()
+            if (!sets.contains("limit")) se.putInt("limit", st.first)
+            if (!trophyOnly) {
+                if (!sets.contains("scale")) se.putFloat("scale", st.second)
+                if (!sets.contains("ttot")) se.putBoolean("ttot", st.third)
+            }
+            se.commit()
+        }
+        return n
     }
 
     // --- Kayıtlar (r1, r2, ... metin; n1, n2, ... isim) ---
