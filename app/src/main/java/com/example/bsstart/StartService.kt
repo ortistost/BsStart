@@ -46,7 +46,21 @@ object ServiceBridge {
 class StartService : AccessibilityService() {
 
     private enum class Phase { LOOP, READING, SWITCH }
-    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW, IF, COLORS }
+    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW, IF, COLORS, AIF }
+
+    // Okuma oyu: hangi değer, hangi ekran karesinden (en az MIN_FRAMES farklı kare gerekir)
+    private class Vote(val value: Int, val frame: Int)
+
+    // Bir ekran karesindeki tüm görüntü varyantlarının OCR sonucu (varyant sırasına göre)
+    private class FrameRead(val raws: Array<String?>, val vals: Array<Int?>) {
+        var info: String = ""
+        fun values(): List<Int> = vals.filterNotNull()
+        fun total(): Int = raws.count { it != null }
+    }
+
+    private class Tally(val counts: Map<Int, Int>, val frames: Map<Int, Int>)
+
+    private class FrameWaiter(val cb: (Bitmap?) -> Unit)
 
     private lateinit var wm: WindowManager
     private val ui = Handler(Looper.getMainLooper())
@@ -55,6 +69,7 @@ class StartService : AccessibilityService() {
     private val stat by lazy { getSharedPreferences("bsstat", MODE_PRIVATE) }
     private val prefListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            aifLast.clear()
             refreshMarkers(); updateTotUi(); updateLabels(); refreshColors()
         }
     private val setListener =
@@ -72,6 +87,8 @@ class StartService : AccessibilityService() {
     private fun limit() = sets.getInt("limit", SlotStore.DEFAULT_LIMIT)
         .coerceIn(SlotStore.MIN_LIMIT, SlotStore.MAX_LIMIT)
     private fun scale() = sets.getFloat("scale", 1f).coerceIn(SlotStore.MIN_SCALE, SlotStore.MAX_SCALE)
+    private fun aifThreshold() = sets.getInt("aifpct", SlotStore.DEFAULT_AIF)
+        .coerceIn(SlotStore.MIN_AIF, SlotStore.MAX_AIF)
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun d(v: Int) = max(1, (v * resources.displayMetrics.density * scale()).toInt())
     private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
@@ -107,6 +124,7 @@ class StartService : AccessibilityService() {
     private var miniItem: Item? = null
     private var calibItem: Item? = null
     private var ifItem: Item? = null
+    private var aifItem: Item? = null
     private var colorsItem: Item? = null
     private var colorsLayer: View? = null
     private var colorsLp: WindowManager.LayoutParams? = null
@@ -120,6 +138,7 @@ class StartService : AccessibilityService() {
     private var rectToken = 0
     private var rectPending = false
     private var liveBusy = false
+    private var liveStartMs = 0L
 
     private var undoSnap: HashMap<String, Any?>? = null
 
@@ -128,6 +147,12 @@ class StartService : AccessibilityService() {
     private var combatRunning = false
     private var nextTapAt = 0L
     private var shotBusy = false
+    private var shotStartMs = 0L
+    private val frameWaiters = ArrayList<FrameWaiter>()
+
+    // if% (gelişmiş if): çözülmüş kayıt önbelleği ve son hesaplanan uyum
+    private val aifCache = HashMap<Int, Pair<String, AifRef?>>()
+    private val aifLast = HashMap<Int, VisionMath.AifScore>()
 
     // Maç kapısı
     private var inMatch = false
@@ -156,9 +181,12 @@ class StartService : AccessibilityService() {
     private var readStartMs = 0L
     private var settleUntil = 0L
     private var ocrBusy = false
-    private var readAttempts = 0
+    private var ocrInFlight = 0
+    private var readAttempts = 0            // okunan ekran karesi sayısı
     private var failCycles = 0
-    private val reads = ArrayList<Int>()
+    private var lastWaitLogMs = 0L
+    private var lastOcrErrLogMs = 0L
+    private val reads = ArrayList<Vote>()
     private var session = 0
     private var recognizer: TextRecognizer? = null
 
@@ -202,9 +230,12 @@ class StartService : AccessibilityService() {
         const val SAMPLE_RADIUS = 3
         const val LABEL_MS = 3000L
 
-        const val OCR_TARGET_H = 128
-        const val VARIANTS = 6
-        const val MAX_READ_ATTEMPTS = 12
+        const val OCR_TARGET_H = 128        // varyant ölçeği 1: kırpılan alan bu yüksekliğe büyütülür
+        const val OCR_TARGET_H2 = 192       // varyant ölçeği 2
+        const val STYLES = 8                // görüntü işleme biçimi sayısı (0-5 eski, 6-7 Otsu)
+        const val VARIANTS = STYLES * 2     // 8 biçim x 2 ölçek
+        const val MAX_READ_ATTEMPTS = 6     // bir okuma turunda en fazla bu kadar ekran karesi
+        const val MIN_FRAMES = 2            // kazanan değer en az bu kadar farklı karede görülmeli
         const val REQUIRED_VOTES = 3
         const val SWITCH_VOTES = 4          // karakter değiştirmek için gereken oy
         const val SUSPECT_SLACK = 10        // olası kupa aralığının dışında kabul edilen pay
@@ -214,6 +245,7 @@ class StartService : AccessibilityService() {
         const val STEP_TIMEOUT_MS = 12000L
         const val STEP_DELAY_MS = 5000L
         const val SETTLE_MS = 2500L
+        const val FRAME_WAIT_MS = 1500L     // test düğmeleri tarama karesini en fazla bu kadar bekler
     }
 
     // Sıradaki boş yuva (1-8); hepsi doluysa null
@@ -253,6 +285,7 @@ class StartService : AccessibilityService() {
         running = false
         session++
         ui.removeCallbacksAndMessages(null)
+        frameWaiters.clear()
         try { prefs.unregisterOnSharedPreferenceChangeListener(prefListener) } catch (_: Exception) {}
         try { sets.unregisterOnSharedPreferenceChangeListener(setListener) } catch (_: Exception) {}
         removeView(calibLayer); calibLayer = null
@@ -316,6 +349,26 @@ class StartService : AccessibilityService() {
             c.drawText(label, (l + rr) / 2f, t - dp(6), txt)
         }
 
+        // if% alanı: mor (henüz ölçülmedi), yeşil (eşik üstü), kırmızı (eşik altı) + son yüzde
+        private fun aifFrame(c: Canvas, b: Rect, n: Int, ref: AifRef) {
+            val sc = aifLast[n]
+            val col = when {
+                sc == null -> Color.parseColor("#B39DDB")
+                sc.total * 100f >= aifThreshold().toFloat() -> Color.parseColor("#00E676")
+                else -> Color.parseColor("#FF5252")
+            }
+            val pad = dp(5).toFloat()
+            val l = ref.x1 * b.width() - loc[0] - pad
+            val t = ref.y1 * b.height() - loc[1] - pad
+            val rr = ref.x2 * b.width() - loc[0] + pad
+            val bb = ref.y2 * b.height() - loc[1] + pad
+            ring.color = col
+            txt.color = col
+            c.drawRect(l, t, rr, bb, ring)
+            val label = if (sc == null) "if% $n" else "if% $n ${Math.round(sc.total * 100f)}%"
+            c.drawText(label, (l + rr) / 2f, t - dp(6), txt)
+        }
+
         private fun drawTotal(c: Canvas, b: Rect) {
             val pad = dp(5).toFloat()
             val top = prefs.getFloat("ty1", 0f) * b.height() - loc[1] - pad
@@ -373,6 +426,10 @@ class StartService : AccessibilityService() {
                 val lab = readLabel
                 frame(c, b, "o", Color.WHITE, if (lab == null) "OKU" else "OKU ($lab)")
                 frame(c, b, "t", Color.parseColor("#FFD600"), "TOPLAM")
+                for (n in 1..8) {
+                    val ref = aifRef(n) ?: continue
+                    aifFrame(c, b, n, ref)
+                }
             }
             if (totalActive()) drawTotal(c, b)
         }
@@ -590,6 +647,11 @@ class StartService : AccessibilityService() {
                     val fm = textP.fontMetrics
                     c.drawText("if", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
                 }
+                Ic.AIF -> {
+                    textP.color = ink; textP.textSize = r * 1.25f
+                    val fm = textP.fontMetrics
+                    c.drawText("if%", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+                }
                 Ic.COLORS -> {
                     val cols = intArrayOf(
                         Color.parseColor("#FF5252"), Color.parseColor("#FFEB3B"),
@@ -715,6 +777,7 @@ class StartService : AccessibilityService() {
         val main = Item(Ic.PLAY, Color.parseColor("#E53935"), Color.WHITE, 44, "Başlat")
         val calib = Item(Ic.PLUS, Color.parseColor("#1E88E5"), Color.WHITE, 28, "Yuva 1")
         val ifb = Item(Ic.IF, Color.parseColor("#7E57C2"), Color.WHITE, 28, "if (-)")
+        val aifb = Item(Ic.AIF, Color.parseColor("#5E35B1"), Color.WHITE, 28, "if% (-)")
         val del = Item(Ic.MINUS, Color.parseColor("#B71C1C"), Color.WHITE, 28, "Hepsini sil")
         val undo = Item(Ic.UNDO, Color.parseColor("#607D8B"), Color.WHITE, 28, "Geri al")
         val hide = Item(Ic.EYE_ON, Color.parseColor("#9E9E9E"), Color.WHITE, 28, "Halkalar")
@@ -730,11 +793,12 @@ class StartService : AccessibilityService() {
         miniItem = mini
         calibItem = calib
         ifItem = ifb
+        aifItem = aifb
         colorsItem = colorsBtn
         hide.iv.icon = if (markersOn) Ic.EYE_ON else Ic.EYE_OFF
         itemMap.clear()
         itemMap["move"] = handle; itemMap["mini"] = mini; itemMap["main"] = main
-        itemMap["calib"] = calib; itemMap["if"] = ifb; itemMap["del"] = del
+        itemMap["calib"] = calib; itemMap["if"] = ifb; itemMap["aif"] = aifb; itemMap["del"] = del
         itemMap["undo"] = undo; itemMap["eye"] = hide; itemMap["area"] = area
         itemMap["live"] = live; itemMap["tot"] = tot; itemMap["save"] = save
         itemMap["colors"] = colorsBtn
@@ -800,6 +864,8 @@ class StartService : AccessibilityService() {
             }
         }
         ifb.iv.setOnClickListener { if (!cancelPick()) startIf() }
+        aifb.iv.setOnClickListener { if (!cancelPick()) startAif() }
+        aifb.iv.setOnLongClickListener { if (!cancelPick()) testAif(); true }
         del.iv.setOnClickListener { if (!cancelPick()) clearSlots() }
         undo.iv.setOnClickListener { if (!cancelPick()) undo() }
         hide.iv.setOnClickListener { if (!cancelPick()) toggleMarkers() }
@@ -1003,6 +1069,7 @@ class StartService : AccessibilityService() {
             calibItem?.tv?.text = if (n == null) "Dolu" else "Yuva $n"
             val last = (1..8).lastOrNull { slotReady(it) }
             ifItem?.tv?.text = if (last == null) "if (-)" else "if ($last)"
+            aifItem?.tv?.text = if (last == null) "if% (-)" else "if% ($last)"
         }
     }
 
@@ -1231,6 +1298,146 @@ class StartService : AccessibilityService() {
         }
     }
 
+    // --- if% (gelişmiş if): alandaki her şeye (renk, şekil, çizgi, yazı) bakar ---
+
+    // Kayıt çözülmüş haliyle önbellekte tutulur; metin değişince yeniden çözülür.
+    private fun aifRef(n: Int): AifRef? {
+        val raw = prefs.getString("aif_$n", null) ?: return null
+        val c = aifCache[n]
+        if (c != null && c.first == raw) return c.second
+        val r = SlotStore.aifDecode(raw)
+        aifCache[n] = raw to r
+        return r
+    }
+
+    private fun aifReady(n: Int) = aifRef(n) != null
+
+    // Kesirli alan -> piksel dikdörtgeni (en az 4x4 piksel)
+    private fun pxRect(bmp: Bitmap, fx1: Float, fy1: Float, fx2: Float, fy2: Float): Rect? {
+        val w0 = bmp.width
+        val h0 = bmp.height
+        val x1 = (fx1 * w0).toInt().coerceIn(0, w0 - 1)
+        val y1 = (fy1 * h0).toInt().coerceIn(0, h0 - 1)
+        val x2 = (fx2 * w0).toInt().coerceIn(x1 + 1, w0)
+        val y2 = (fy2 * h0).toInt().coerceIn(y1 + 1, h0)
+        return if (x2 - x1 < 4 || y2 - y1 < 4) null else Rect(x1, y1, x2, y2)
+    }
+
+    private fun aifSnapshot(bmp: Bitmap, l: Float, t: Float, r: Float, b: Float): AifRef? {
+        val rc = pxRect(bmp, l, t, r, b) ?: return null
+        val w = rc.width()
+        val h = rc.height()
+        return try {
+            val px = IntArray(w * h)
+            bmp.getPixels(px, 0, w, rc.left, rc.top, w, h)
+            val g = VisionMath.gridSize(w, h)
+            AifRef(l, t, r, b, g[0], g[1], VisionMath.downsample(px, w, h, g[0], g[1]))
+        } catch (_: Exception) { null }
+    }
+
+    private fun aifScore(n: Int, bmp: Bitmap): VisionMath.AifScore? {
+        val ref = aifRef(n) ?: return null
+        val rc = pxRect(bmp, ref.x1, ref.y1, ref.x2, ref.y2) ?: return null
+        val w = rc.width()
+        val h = rc.height()
+        return try {
+            val px = IntArray(w * h)
+            bmp.getPixels(px, 0, w, rc.left, rc.top, w, h)
+            val cur = VisionMath.downsample(px, w, h, ref.gw, ref.gh)
+            VisionMath.compare(ref.rgb, cur, ref.gw, ref.gh)
+        } catch (_: Exception) { null }
+    }
+
+    // Toplam uyum yüzdesi eşiğin (varsayılan %90) üstündeyse true
+    private fun aifMatch(n: Int, bmp: Bitmap): Boolean {
+        val s = aifScore(n, bmp) ?: return false
+        aifLast[n] = s
+        return s.total * 100f >= aifThreshold().toFloat()
+    }
+
+    // if%: en son kaydedilen yuvaya bağlanır (if ile aynı kural), alanı iki köşeyle seçersin
+    private fun startAif() {
+        val last = (1..8).lastOrNull { slotReady(it) }
+        if (last == null) { toast("Önce yuva kaydet, ilk kayıt if% olamaz"); return }
+        if (last == CHARACTER || last == SELECT) {
+            toast("7 ve 8 görüntüye bakmaz, bunlara if% konmaz"); return
+        }
+        if (aifReady(last)) { toast("if% ($last) zaten var"); return }
+        selectAif(last)
+    }
+
+    private fun selectAif(slot: Int) {
+        if (calibLayer != null) return
+        val t = ++rectToken
+        rectPending = true
+        pickPoint("if% ($slot): bakılacak alanın SOL ÜST köşesine dokun. İptal: panelde bir butona bas") { x1, y1 ->
+            ui.postDelayed({
+                if (t != rectToken) return@postDelayed
+                pickPoint("if% ($slot): şimdi SAĞ ALT köşeye dokun. İptal: panelde bir butona bas") { x2, y2 ->
+                    rectPending = false
+                    val l = min(x1, x2); val r = max(x1, x2)
+                    val tp = min(y1, y2); val bt = max(y1, y2)
+                    if (r - l < 0.01f || bt - tp < 0.01f) {
+                        toast("Alan çok küçük, tekrar dene")
+                    } else {
+                        saveAif(slot, l, tp, r, bt)
+                    }
+                }
+            }, 300)
+        }
+    }
+
+    private fun r4(f: Float) = Math.round(f * 10000f) / 10000f
+
+    // Alanın o anki görüntüsünü referans olarak kaydeder
+    private fun saveAif(slot: Int, l0: Float, t0: Float, r0: Float, b0: Float) {
+        val l = r4(l0); val t = r4(t0); val r = r4(r0); val b = r4(b0)
+        ui.postDelayed({
+            withScreenshotWait { bmp ->
+                val ref = bmp?.let { aifSnapshot(it, l, t, r, b) }
+                if (ref == null) {
+                    toast("Alan alınamadı, kaydedilmedi. Tekrar dene.")
+                } else {
+                    saveUndo()
+                    prefs.edit().putString("aif_$slot", SlotStore.aifEncode(ref)).commit()
+                    refreshMarkers()
+                    updateLabels()
+                    toast("if% ($slot) kaydedildi (${ref.gw}x${ref.gh} hücre). Uyumu görmek için if% düğmesine basılı tut.")
+                }
+            }
+        }, 300)
+    }
+
+    // if% düğmesine uzun basış: kayıtlı tüm if% alanlarının şu anki uyumunu gösterir
+    private fun testAif() {
+        val ns = (1..8).filter { aifReady(it) }
+        if (ns.isEmpty()) { toast("Kayıtlı if% yok"); return }
+        withScreenshotWait { bmp ->
+            if (bmp == null) {
+                toast("Ekran alınamadı")
+            } else {
+                val th = aifThreshold()
+                val sb = StringBuilder("if% (eşik %$th)")
+                for (n in ns) {
+                    val s = aifScore(n, bmp)
+                    if (s == null) {
+                        sb.append("\n$n: hesaplanamadı")
+                    } else {
+                        aifLast[n] = s
+                        val pc = Math.round(s.total * 100f)
+                        val pcc = Math.round(s.color * 100f)
+                        val pce = Math.round(s.edge * 100f)
+                        sb.append("\n$n: %$pc (renk %$pcc, şekil %$pce) ")
+                        sb.append(if (s.total * 100f >= th.toFloat()) "uyuyor" else "uymuyor")
+                    }
+                }
+                toast(sb.toString())
+                logRead(sb.toString().replace("\n", " | "))
+                refreshMarkers()
+            }
+        }
+    }
+
     private fun selectRect(p: String) {
         if (calibLayer != null) return
         val name = if (p == "o") "Karakter kupası alanı" else "Toplam kupa alanı"
@@ -1262,39 +1469,115 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // Test oku: 6 görüntü işleme x en fazla 3 ekran görüntüsü, oy çoğunluğu.
+    // --- Kupa okuma (hem sistem hem test aynı hattı kullanır) ---
+
+    // Bir ekran karesinde okuma alanını tüm VARIANTS varyantıyla okur; hepsi bitince cb çağrılır.
+    // bmp yalnızca bu çağrı dönene kadar geçerli: kırpmalar burada, eşzamanlı alınır.
+    // Okuma alanı geçersizse cb(null).
+    private fun readFrame(bmp: Bitmap, cb: (FrameRead?) -> Unit) {
+        val crops = arrayOfNulls<Bitmap>(VARIANTS)
+        var made = 0
+        for (v in 0 until VARIANTS) {
+            val c = cropForOcr(bmp, v)
+            if (c != null) { crops[v] = c; made++ }
+        }
+        if (made == 0) { cb(null); return }
+        val fr = FrameRead(arrayOfNulls<String>(VARIANTS), arrayOfNulls<Int>(VARIANTS))
+        fr.info = regionStats(bmp, "o")
+        var left = made
+        for (v in 0 until VARIANTS) {
+            val c = crops[v] ?: continue
+            recognize(c) { raw ->
+                fr.raws[v] = clean(raw)
+                fr.vals[v] = TrophyParser.parse(raw)
+                left--
+                if (left == 0) cb(fr)
+            }
+        }
+    }
+
+    private fun tallyText(vals: List<Int>): String {
+        if (vals.isEmpty()) return "(boş)"
+        return vals.groupingBy { it }.eachCount().entries
+            .sortedByDescending { it.value }.take(3)
+            .joinToString(", ", "(", ")") { "${it.key}×${it.value}" }
+    }
+
+    private fun rawSample(fr: FrameRead): String =
+        fr.raws.filterNotNull().filter { it.isNotEmpty() }.distinct().take(3)
+            .joinToString("|") { it.take(14) }
+
+    // Okuma alanının ekran görüntüsündeki durumu: tamamen siyah/boş kare mi, yazı benzeri kenar var mı
+    private fun regionStats(bmp: Bitmap, p: String): String {
+        val rc = rectPx(bmp, p) ?: return "alan yok"
+        val w = rc.width()
+        val h = rc.height()
+        return try {
+            val px = IntArray(w * h)
+            bmp.getPixels(px, 0, w, rc.left, rc.top, w, h)
+            var sum = 0L
+            var edges = 0
+            var cnt = 0
+            for (y in 0 until h) {
+                val row = y * w
+                var prev = lumaOfPixel(px[row])
+                for (x in 0 until w) {
+                    val l = lumaOfPixel(px[row + x])
+                    sum += l
+                    if (x > 0 && abs(l - prev) > 40) edges++
+                    prev = l
+                    cnt++
+                }
+            }
+            "alan ${w}x$h parlaklık ${sum / cnt} kenar %${edges * 100 / cnt}"
+        } catch (_: Exception) { "alan okunamadı" }
+    }
+
+    private fun lumaOfPixel(p: Int) = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
+
+    // Test oku: birkaç ekran karesi x 16 varyant, oy çoğunluğu. Sadece hiçbir varyant sayı bulamazsa "Yok".
     private fun liveRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
         if (running) { toast("Önce döngüyü durdur"); return }
-        if (liveBusy) return
+        val t0 = System.currentTimeMillis()
+        if (liveBusy && t0 - liveStartMs < 15000L) return
         liveBusy = true
+        liveStartMs = t0
         val votes = ArrayList<Int>()
         val raws = ArrayList<String>()
+        var total = 0
+        var info = ""
 
-        fun finish() {
+        fun finish(why: String?) {
             liveBusy = false
-            val best = votes.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
-            showLabel(best?.toString() ?: "Yok")
+            val best = votes.groupingBy { it }.eachCount().maxByOrNull { it.value }
             if (best == null) {
+                showLabel("Yok")
                 val r = raws.filter { it.isNotEmpty() }.distinct().take(4).joinToString(" | ")
-                toast("Okunamadı. Ham: " + (if (r.isEmpty()) "boş / ekran alınamadı" else r).take(140))
+                val msg = (why ?: "Okunamadı") + ". Ham: " + (if (r.isEmpty()) "boş" else r).take(140)
+                toast(msg)
+                logRead("test: $msg | $info")
+            } else {
+                showLabel("${best.key} (${best.value}/$total)")
+                logRead("test: ${best.key} ${best.value}/$total oy | $info")
             }
         }
 
         fun round(n: Int) {
             withScreenshotWait { bmp ->
-                if (bmp == null) { finish(); return@withScreenshotWait }
-                val crops = (0 until VARIANTS).mapNotNull { cropForOcr(bmp, it) }
-                if (crops.isEmpty()) { finish(); return@withScreenshotWait }
-                var left = crops.size
-                for (cr in crops) {
-                    recognize(cr) { raw ->
-                        raws.add(clean(raw))
-                        TrophyParser.parse(raw)?.let { votes.add(it) }
-                        left--
-                        if (left == 0) {
+                if (bmp == null) {
+                    finish("Ekran görüntüsü alınamadı")
+                } else {
+                    readFrame(bmp) { fr ->
+                        if (fr == null) {
+                            finish("Okuma alanı geçersiz")
+                        } else {
+                            total += fr.total()
+                            info = fr.info
+                            votes.addAll(fr.values())
+                            raws.addAll(fr.raws.filterNotNull())
                             val top = votes.groupingBy { it }.eachCount().maxOfOrNull { it.value } ?: 0
-                            if (top >= 2 || n >= 2) finish()
+                            if (top >= 2 || n >= 2) finish(null)
                             else ui.postDelayed({ round(n + 1) }, 350)
                         }
                     }
@@ -1304,16 +1587,27 @@ class StartService : AccessibilityService() {
         round(0)
     }
 
+    // Alan seç düğmesine uzun basış: tek karede her varyantın ham OCR çıktısını gösterir
     private fun testRead() {
         if (!SlotStore.rectReady(prefs)) { toast("Önce okuma alanını seç"); return }
         if (running) { toast("Önce döngüyü durdur"); return }
         withScreenshotWait { bmp ->
-            if (bmp == null) { toast("Ekran alınamadı"); return@withScreenshotWait }
-            for (v in 0 until VARIANTS) {
-                val crop = cropForOcr(bmp, v)
-                if (crop == null) { toast("Okuma alanı geçersiz"); return@withScreenshotWait }
-                recognize(crop) { raw ->
-                    toast("Test$v: '${clean(raw)}' → ${TrophyParser.parse(raw) ?: "okunamadı"}")
+            if (bmp == null) {
+                toast("Ekran alınamadı")
+            } else {
+                readFrame(bmp) { fr ->
+                    if (fr == null) {
+                        toast("Okuma alanı geçersiz")
+                    } else {
+                        val vals = fr.values()
+                        val line = "Test: ${vals.size}/${fr.total()} okudu ${tallyText(vals)} | ${fr.info}"
+                        toast(line)
+                        logRead(line)
+                        val detail = fr.raws.mapIndexed { i, r ->
+                            if (r == null) null else "$i:'${r.take(10)}'→${fr.vals[i] ?: "?"}"
+                        }.filterNotNull().joinToString("  ")
+                        logRead("test ayrıntı $detail")
+                    }
                 }
             }
         }
@@ -1378,7 +1672,8 @@ class StartService : AccessibilityService() {
                 else -> "kupa alanı yok, kontrol kapalı"
             }
             val ifc = (1..8).count { slotReady(IF_BASE + it) }
-            val ifs = if (ifc > 0) ", $ifc if" else ""
+            val aifc = (1..8).count { aifReady(it) }
+            val ifs = (if (ifc > 0) ", $ifc if" else "") + (if (aifc > 0) ", $aifc if%" else "")
             toast(if (missing.isEmpty()) "Döngü açık, $ocr$ifs" else "Döngü açık, eksik yuvalar: $missing")
         } else {
             haltLoop()
@@ -1399,18 +1694,24 @@ class StartService : AccessibilityService() {
         override fun run() {
             if (!running && !totalActive()) { scanRunning = false; return }
             if (calibLayer == null) {
-                withScreenshot { bmp -> if (bmp != null) evaluate(bmp) }
+                withScreenshot { bmp ->
+                    if (bmp != null) {
+                        evaluate(bmp)
+                        deliverFrame(bmp)
+                    }
+                }
             }
             ui.postDelayed(this, SCAN_PERIOD_MS)
         }
     }
 
-    // Saniyede 3 basış. if (2) varsa sadece if rengi görünürken basar.
+    // Saniyede 3 basış. if (2) veya if% (2) varsa sadece o koşul görünürken basar.
     private val combatTick = object : Runnable {
         override fun run() {
             if (!running) { combatRunning = false; return }
             val now = System.currentTimeMillis()
-            val ok = if (slotReady(ATTACK_IF)) now - lastAttackSeenMs < IF_HOLD_MS
+            val gated = slotReady(ATTACK_IF) || aifReady(ATTACK)
+            val ok = if (gated) now - lastAttackSeenMs < IF_HOLD_MS
             else now - lastGateMs < GATE_FRESH_MS
             if (inMatch && ok && phase == Phase.LOOP && slotReady(ATTACK)) {
                 tapSlot(ATTACK)
@@ -1427,9 +1728,11 @@ class StartService : AccessibilityService() {
         return close(c, prefs.getInt("c$i", 0), tol)
     }
 
-    // Yuvanın rengi görünüyor ve (varsa) if rengi de görünüyor
+    // Yuvanın rengi görünüyor ve (varsa) if rengi ile if% uyumu da tamam
     private fun menuHit(i: Int, bmp: Bitmap) =
-        hit(i, bmp) && (!slotReady(IF_BASE + i) || hit(IF_BASE + i, bmp))
+        hit(i, bmp) &&
+            (!slotReady(IF_BASE + i) || hit(IF_BASE + i, bmp)) &&
+            (!aifReady(i) || aifMatch(i, bmp))
 
     private fun attackMatch(bmp: Bitmap): Boolean {
         if (!slotReady(ATTACK)) return false
@@ -1461,11 +1764,18 @@ class StartService : AccessibilityService() {
 
         for (i in MENU_SLOTS) streak[i] = if (menuHit(i, bmp)) streak[i] + 1 else 0
         val ifMode = slotReady(ATTACK_IF)
-        val sig = if (ifMode) hit(ATTACK_IF, bmp) else attackMatch(bmp)
+        val aifMode = aifReady(ATTACK)
+        val sig = when {
+            aifMode -> aifMatch(ATTACK, bmp) && (!ifMode || hit(ATTACK_IF, bmp))
+            ifMode -> hit(ATTACK_IF, bmp)
+            else -> attackMatch(bmp)
+        }
+        if (aifLast.isNotEmpty()) refreshMarkers()
         if (sig) { hitStreak++; missStreak = 0; lastAttackSeenMs = now }
         else { hitStreak = 0; missStreak++ }
 
         if (hitStreak >= ABORT_ATTACK_SCANS && phase != Phase.LOOP) {
+            if (phase == Phase.READING) logRead("okuma yarıda kesildi: saldırı/if sinyali $hitStreak taramadır görünüyor")
             phase = Phase.LOOP
             ocrBusy = false; switchArmed = false; afterSwitch = false
             switchToken++
@@ -1479,10 +1789,10 @@ class StartService : AccessibilityService() {
         }
 
         if (phase == Phase.LOOP && inMatch) {
-            if (ifMode) {
+            if (ifMode || aifMode) {
                 if (missStreak >= IF_EXIT_MISSES) {
                     inMatch = false; hitStreak = 0; endStreak.fill(0)
-                    note("Maç bitti (if rengi gitti)")
+                    note(if (aifMode) "Maç bitti (if% uymadı)" else "Maç bitti (if rengi gitti)")
                 }
             } else {
                 if (sig) endStreak.fill(0)
@@ -1535,30 +1845,43 @@ class StartService : AccessibilityService() {
         if (now < settleUntil) return
         if (now - readStartMs > READ_TIMEOUT_MS) { readFailed("Okuma zaman aşımı"); return }
         if (ocrBusy) return
-        if (!hit(PLAY, bmp)) return
-        val crop = cropForOcr(bmp, readAttempts % VARIANTS)
-        if (crop == null) { stopAll("Okuma alanı geçersiz: sistem durdu"); return }
+        if (!hit(PLAY, bmp)) {
+            if (now - lastWaitLogMs > 5000L) {
+                lastWaitLogMs = now
+                logRead("okuma bekliyor: yuva 1 (Maça gir) rengi görünmüyor")
+            }
+            return
+        }
         ocrBusy = true
         val s = session
-        recognize(crop) { raw ->
+        readFrame(bmp) { fr ->
             if (s == session) {
                 ocrBusy = false
-                onRead(raw)
+                if (fr == null) stopAll("Okuma alanı geçersiz: sistem durdu") else onRead(fr)
             }
         }
     }
 
-    private fun onRead(raw: String?) {
+    private fun onRead(fr: FrameRead) {
         if (!running || phase != Phase.READING) return
-        val v = TrophyParser.parse(raw)
         readAttempts++
-        toast("Okuma $readAttempts: '${clean(raw)}' → ${v ?: "?"}")
-        logRead("okuma $readAttempts: '${clean(raw)}' → ${v ?: "?"}")
-        if (v != null) reads.add(v)
+        val vals = fr.values()
+        for (v in vals) reads.add(Vote(v, readAttempts))
+        val head = "okuma $readAttempts: ${vals.size}/${fr.total()} okudu ${tallyText(vals)}"
+        toast(head)
+        logRead(head + (if (vals.isEmpty()) " ham: ${rawSample(fr)}" else "") + " | ${fr.info}")
         val winner = pickWinner()
         when {
             winner != null -> decide(winner)
-            readAttempts >= MAX_READ_ATTEMPTS -> readFailed("Kupa okunamadı")
+            readAttempts >= MAX_READ_ATTEMPTS -> {
+                val weak = weakWinner()
+                if (weak != null) {
+                    logRead("zayıf çoğunluk kabul edildi: $weak")
+                    decide(weak)
+                } else {
+                    readFailed("Kupa okunamadı")
+                }
+            }
         }
     }
 
@@ -1580,18 +1903,44 @@ class StartService : AccessibilityService() {
         startReading(System.currentTimeMillis() + 1500)
     }
 
-    // En çok oy alan değer kazanır (beraberlikte okumaya devam). Sınırın altı 3 oyla kabul edilir;
-    // sınır ve üstü (karakter değiştirir) en az 4 oy ister ve sınır altı okumalar (en fazla 1 sapma) çelişmemeli.
+    private fun tallyVotes(): Tally {
+        val c = HashMap<Int, Int>()
+        val f = HashMap<Int, HashSet<Int>>()
+        for (r in reads) {
+            c[r.value] = (c[r.value] ?: 0) + 1
+            f.getOrPut(r.value) { HashSet() }.add(r.frame)
+        }
+        return Tally(c, f.mapValues { it.value.size })
+    }
+
+    // En çok oy alan değer kazanır (beraberlikte okumaya devam), en az MIN_FRAMES farklı karede görülmeli.
+    // Sınırın altı 3 oyla kabul edilir; sınır ve üstü (karakter değiştirir) en az 4 oy ister ve
+    // sınır altı okumalar (kazanan oyun dörtte biri kadar) çelişmemeli.
     private fun pickWinner(): Int? {
         val lim = limit()
-        val counts = reads.groupingBy { it }.eachCount()
-        val ranked = counts.entries.sortedByDescending { it.value }
+        val t = tallyVotes()
+        val ranked = t.counts.entries.sortedByDescending { it.value }
         val top = ranked.firstOrNull() ?: return null
         val second = ranked.getOrNull(1)?.value ?: 0
         if (top.value < REQUIRED_VOTES || top.value <= second) return null
+        if ((t.frames[top.key] ?: 0) < MIN_FRAMES) return null
         if (top.key < lim) return top.key
-        val low = counts.entries.filter { it.key < lim }.sumOf { it.value }
-        return if (top.value >= SWITCH_VOTES && low <= 1) top.key else null
+        val low = t.counts.entries.filter { it.key < lim }.sumOf { it.value }
+        return if (top.value >= SWITCH_VOTES && low <= top.value / 4) top.key else null
+    }
+
+    // Tur sonunda net bir sonuç çıkmadıysa: sınırın ALTINDAKİ belirgin çoğunluğu (en az 2 oy,
+    // ikincinin iki katı, en az 2 karede) kabul eder. Karakter değiştirmeye yol açan değerler için asla.
+    private fun weakWinner(): Int? {
+        val lim = limit()
+        val t = tallyVotes()
+        val ranked = t.counts.entries.sortedByDescending { it.value }
+        val top = ranked.firstOrNull() ?: return null
+        val second = ranked.getOrNull(1)?.value ?: 0
+        if (top.key >= lim) return null
+        if (top.value < 2 || top.value < second * 2) return null
+        if ((t.frames[top.key] ?: 0) < MIN_FRAMES) return null
+        return top.key
     }
 
     // Bilinen kupadan maçlarla ulaşılamayacak bir okuma: yok sayılır, karakter değişmez.
@@ -1678,27 +2027,36 @@ class StartService : AccessibilityService() {
 
     private fun cropForOcr(bmp: Bitmap, variant: Int): Bitmap? = cropRect(bmp, "o", variant)
 
-    // 0 normal, 1 kontrastlı gri, 2 kontrastlı gri ters, 3 ters renk,
-    // 4 parlak yazıyı siyaha çeviren eşik, 5 parlak yazı beyaz kalan eşik
-    private fun cropRect(bmp: Bitmap, p: String, variant: Int): Bitmap? {
+    // "o" okuma alanı, "t" toplam alanı: kayıtlı kesirli alanın piksel dikdörtgeni
+    private fun rectPx(bmp: Bitmap, p: String): Rect? {
         val ok = if (p == "o") SlotStore.rectReady(prefs) else SlotStore.totReady(prefs)
         if (!ok) return null
-        val w0 = bmp.width; val h0 = bmp.height
-        val x1 = (prefs.getFloat("${p}x1", 0f) * w0).toInt().coerceIn(0, w0 - 1)
-        val y1 = (prefs.getFloat("${p}y1", 0f) * h0).toInt().coerceIn(0, h0 - 1)
-        val x2 = (prefs.getFloat("${p}x2", 0f) * w0).toInt().coerceIn(x1 + 1, w0)
-        val y2 = (prefs.getFloat("${p}y2", 0f) * h0).toInt().coerceIn(y1 + 1, h0)
-        val w = x2 - x1; val h = y2 - y1
+        return pxRect(
+            bmp, prefs.getFloat("${p}x1", 0f), prefs.getFloat("${p}y1", 0f),
+            prefs.getFloat("${p}x2", 0f), prefs.getFloat("${p}y2", 0f)
+        )
+    }
+
+    // variant = ölçek * STYLES + biçim.
+    // Biçim: 0 normal, 1 kontrastlı gri, 2 kontrastlı gri ters, 3 ters renk,
+    // 4 parlak yazıyı siyaha çeviren eşik, 5 parlak yazı beyaz kalan eşik,
+    // 6 Otsu (az görülen sınıf yazı, siyah üstüne beyaz zemin), 7 Otsu ters.
+    // Ölçek: 0 -> OCR_TARGET_H, 1 -> OCR_TARGET_H2 yüksekliğine büyütülür.
+    private fun cropRect(bmp: Bitmap, p: String, variant: Int): Bitmap? {
+        val rc = rectPx(bmp, p) ?: return null
+        val w = rc.width()
+        val h = rc.height()
         if (w < 8 || h < 8) return null
         return try {
-            val crop = Bitmap.createBitmap(bmp, x1, y1, w, h)
-            val s = (OCR_TARGET_H.toFloat() / h).coerceIn(1f, 4f)
+            val crop = Bitmap.createBitmap(bmp, rc.left, rc.top, w, h)
+            val target = if ((variant / STYLES) % 2 == 0) OCR_TARGET_H else OCR_TARGET_H2
+            val s = (target.toFloat() / h).coerceIn(1f, 4f)
             val sized = if (s <= 1.01f) crop else {
                 val scaled = Bitmap.createScaledBitmap(crop, (w * s).toInt(), (h * s).toInt(), true)
                 if (scaled !== crop) crop.recycle()
                 scaled
             }
-            styleVariant(padBitmap(sized), variant)
+            styleVariant(padBitmap(sized), variant % STYLES)
         } catch (_: Exception) { null }
     }
 
@@ -1726,8 +2084,37 @@ class StartService : AccessibilityService() {
         0f, 0f, 0f, 1f, 0f
     ))
 
+    // Otsu eşiğiyle iki renge indirir. flip=false: yazı (az görülen sınıf) siyah, zemin beyaz.
+    private fun otsuVariant(src: Bitmap, flip: Boolean): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val lum = IntArray(px.size)
+        val hist = IntArray(256)
+        for (i in px.indices) {
+            val l = lumaOfPixel(px[i]).coerceIn(0, 255)
+            lum[i] = l
+            hist[l]++
+        }
+        val t = VisionMath.otsu(hist, px.size)
+        var above = 0
+        for (l in lum) if (l > t) above++
+        val brightIsText = above * 2 < px.size
+        for (i in px.indices) {
+            val bright = lum[i] > t
+            val isText = if (brightIsText) bright else !bright
+            px[i] = if (isText != flip) Color.BLACK else Color.WHITE
+        }
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        src.recycle()
+        return out
+    }
+
     private fun styleVariant(src: Bitmap, variant: Int): Bitmap {
         if (variant == 0) return src
+        if (variant >= 6) return otsuVariant(src, variant == 7)
         val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
         val cm = ColorMatrix()
         when (variant) {
@@ -1749,15 +2136,39 @@ class StartService : AccessibilityService() {
         return out
     }
 
+    // OCR hatası olursa nedeni "Son okumalar"a yazılır; bekleyen iş kalmadıysa tanıyıcı yeniden kurulur.
     private fun recognize(bm: Bitmap, cb: (String?) -> Unit) {
         try {
             val r = recognizer ?: TextRecognition
                 .getClient(TextRecognizerOptions.DEFAULT_OPTIONS).also { recognizer = it }
-            r.process(InputImage.fromBitmap(bm, 0))
-                .addOnSuccessListener { res -> bm.recycle(); cb(res.text) }
-                .addOnFailureListener { bm.recycle(); cb(null) }
-        } catch (_: Exception) {
-            bm.recycle(); cb(null)
+            val task = r.process(InputImage.fromBitmap(bm, 0))
+            ocrInFlight++
+            task.addOnSuccessListener { res ->
+                ocrInFlight--
+                bm.recycle()
+                cb(res.text)
+            }.addOnFailureListener { e ->
+                ocrInFlight--
+                bm.recycle()
+                ocrFailed(e)
+                cb(null)
+            }
+        } catch (e: Exception) {
+            bm.recycle()
+            ocrFailed(e)
+            cb(null)
+        }
+    }
+
+    private fun ocrFailed(e: Exception) {
+        val now = System.currentTimeMillis()
+        if (now - lastOcrErrLogMs > 3000L) {
+            lastOcrErrLogMs = now
+            logRead("OCR hatası: ${e.javaClass.simpleName} ${e.message?.take(80) ?: ""}")
+        }
+        if (ocrInFlight <= 0) {
+            try { recognizer?.close() } catch (_: Exception) {}
+            recognizer = null
         }
     }
 
@@ -1781,38 +2192,75 @@ class StartService : AccessibilityService() {
 
     // Bitmap yalnızca callback içinde geçerli; çıkışta serbest bırakılır
     private fun withScreenshot(done: (Bitmap?) -> Unit) {
-        if (shotBusy) { done(null); return }
+        if (shotBusy) {
+            // takeScreenshot geri çağrısı hiç gelmezse bayrak sonsuza dek takılı kalmasın
+            if (System.currentTimeMillis() - shotStartMs > 4000L) shotBusy = false
+            else { done(null); return }
+        }
         shotBusy = true
-        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
-            object : TakeScreenshotCallback {
-                override fun onSuccess(result: ScreenshotResult) {
-                    var bmp: Bitmap? = null
-                    try {
-                        val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
-                        bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
-                        hw?.recycle()
-                    } catch (_: Exception) {
-                    } finally {
-                        result.hardwareBuffer.close()
-                        shotBusy = false
+        shotStartMs = System.currentTimeMillis()
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(result: ScreenshotResult) {
+                        var bmp: Bitmap? = null
+                        try {
+                            val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                            bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                            hw?.recycle()
+                        } catch (_: Exception) {
+                        } finally {
+                            result.hardwareBuffer.close()
+                            shotBusy = false
+                        }
+                        try { done(bmp) } finally { bmp?.recycle() }
                     }
-                    try { done(bmp) } finally { bmp?.recycle() }
-                }
 
-                override fun onFailure(errorCode: Int) {
-                    shotBusy = false
-                    done(null)
-                }
-            })
+                    override fun onFailure(errorCode: Int) {
+                        shotBusy = false
+                        done(null)
+                    }
+                })
+        } catch (e: Exception) {
+            shotBusy = false
+            logRead("ekran görüntüsü hatası: ${e.javaClass.simpleName} ${e.message?.take(60) ?: ""}")
+            done(null)
+        }
+    }
+
+    // Tarama zaten ~0,35 sn'de bir ekran görüntüsü alıyor; Android iki görüntü arasında en az bir süre
+    // bekletir (bildiğim kadarıyla yaklaşık 0,33 sn). Test düğmeleri ayrı görüntü istemek yerine taramanın
+    // bir sonraki karesini bekler; tarama yoksa ya da kare gelmezse eski yöntemle kendi görüntüsünü alır.
+    private fun withScreenshotWait(tries: Int = 15, done: (Bitmap?) -> Unit) {
+        if (!scanRunning) { shotRetry(tries, done); return }
+        val w = FrameWaiter(done)
+        frameWaiters.add(w)
+        ui.postDelayed({
+            if (frameWaiters.remove(w)) shotRetry(tries, done)
+        }, FRAME_WAIT_MS)
     }
 
     // Meşgul veya sistem aralık hatası verirse bekleyip tekrar dener (en fazla ~2,3 sn)
-    private fun withScreenshotWait(tries: Int = 15, done: (Bitmap?) -> Unit) {
+    private fun shotRetry(tries: Int, done: (Bitmap?) -> Unit) {
         withScreenshot { bmp ->
             if (bmp == null && tries > 0) {
-                ui.postDelayed({ withScreenshotWait(tries - 1, done) }, 150)
+                ui.postDelayed({ shotRetry(tries - 1, done) }, 150)
             } else {
                 done(bmp)
+            }
+        }
+    }
+
+    // Tarama karesini bekleyen test düğmelerine verir (bitmap yalnızca bu çağrı boyunca geçerli)
+    private fun deliverFrame(bmp: Bitmap) {
+        if (frameWaiters.isEmpty()) return
+        val list = ArrayList(frameWaiters)
+        frameWaiters.clear()
+        for (w in list) {
+            try {
+                w.cb(bmp)
+            } catch (e: Exception) {
+                logRead("kare geri çağrısı hatası: ${e.javaClass.simpleName} ${e.message?.take(60) ?: ""}")
             }
         }
     }
