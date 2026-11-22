@@ -10,11 +10,15 @@ object SlotStore {
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
     const val DEFAULT_AIF = 90    // if% eşiği (%)
-    const val MIN_AIF = 50
+    const val MIN_AIF = 25
     const val MAX_AIF = 100
     const val MAX_LIMIT = 3000
-    const val MIN_SCALE = 0.6f
-    const val MAX_SCALE = 1.25f
+    const val MIN_SCALE = 0.5f
+    const val MAX_SCALE = 1.5f
+    const val DEFAULT_ATK_RATE = 3f   // Saldırı (yuva 2) basışı, saniyede kaç kez
+    const val MIN_ATK_RATE = 0.3f
+    const val MAX_ATK_RATE = 10f
+    const val MAX_RECORDS = 10        // en fazla kayıt sayısı
     const val SLOTS = 18          // 1-8 yuvalar, 11-18 = if (1)..if (8)
     const val IF_BASE = 10
     const val HEADER = "BsStart slots v2"
@@ -50,9 +54,9 @@ object SlotStore {
 
     fun btnOn(sets: SharedPreferences, key: String) = sets.getBoolean("btn_$key", true)
 
-    // Otomatik kupa anahtarı. Hiç ayarlanmadıysa okuma alanı varsa açık sayılır (eski davranış).
-    fun autoTrophy(sets: SharedPreferences, p: SharedPreferences) =
-        if (sets.contains("atrophy")) sets.getBoolean("atrophy", false) else rectReady(p)
+    // Otomatik kupa anahtarı kaldırıldı: okuma alanı kayıtlıysa kupa kontrolü her zaman açıktır.
+    @Suppress("UNUSED_PARAMETER")
+    fun autoTrophy(sets: SharedPreferences, p: SharedPreferences) = rectReady(p)
 
     fun ready(p: SharedPreferences, i: Int) =
         p.contains("c$i") && p.getFloat("x$i", -1f) >= 0f
@@ -320,9 +324,12 @@ object SlotStore {
             else null
         }.sortedBy { it.first }
 
+    // Aynısı varsa (n, false); kayıt sınırı doluysa (-1, false); yeni eklendiyse (n, true)
     fun recAddUnique(r: SharedPreferences, text: String): Pair<Int, Boolean> {
         val want = norm(text)
-        recList(r).firstOrNull { norm(it.second) == want }?.let { return it.first to false }
+        val all = recList(r)
+        all.firstOrNull { norm(it.second) == want }?.let { return it.first to false }
+        if (all.size >= MAX_RECORDS) return -1 to false
         val n = r.getInt("next", 1)
         r.edit().putString("r$n", text).putInt("next", n + 1).commit()
         return n to true
@@ -392,5 +399,55 @@ object TrophyParser {
             }
         }
         return best
+    }
+}
+// Kupa tablosu (karakter kupasına göre). Tek kaynak: hem ekranda gösterilir hem de
+// StartService'te maç başına olası kupa kaybını hesaplamak için kullanılır.
+object TrophyTable {
+    class Row(
+        val from: Int, val to: Int, val win: Int, val loss: Int,
+        val streak: Boolean, val underdog: Boolean, val bot: Boolean
+    )
+
+    val ROWS = listOf(
+        Row(0, 49, 10, 0, true, true, true),
+        Row(50, 299, 10, 1, true, true, true),
+        Row(300, 599, 10, 2, true, true, true),
+        Row(600, 799, 10, 3, true, true, true),
+        Row(800, 999, 10, 4, true, true, true),
+        Row(1000, 1099, 10, 5, true, true, true),
+        Row(1100, 1199, 10, 6, true, true, true),
+        Row(1200, 1299, 10, 7, true, true, true),
+        Row(1300, 1499, 10, 8, true, true, true),
+        Row(1500, 1799, 10, 9, true, true, true),
+        Row(1800, 1999, 10, 10, true, true, true),
+        Row(2000, 2499, 8, 10, false, false, false),
+        Row(2500, 2799, 6, 10, false, false, false),
+        Row(2800, 2999, 4, 10, false, false, false),
+        Row(3000, 3099, 2, 10, false, false, false),
+        Row(3100, 3999, 1, 10, false, false, false),
+        Row(4000, Int.MAX_VALUE, 1, 15, false, false, false)
+    )
+
+    fun rowAt(t: Int): Row = ROWS.lastOrNull { t >= it.from } ?: ROWS.first()
+
+    // Bu kupadayken bir maçta kaybedilebilecek en fazla kupa. Kayıp kupayla birlikte artar.
+    fun lossAt(t: Int): Int = rowAt(t).loss
+
+    fun asText(): String {
+        val sb = StringBuilder()
+        sb.append("Kupa".padEnd(10)).append("Kaz".padEnd(4)).append("Kay".padEnd(5))
+            .append("Ber".padEnd(4)).append("Seri".padEnd(5)).append("Underdog".padEnd(9)).append("Bot")
+        for (r in ROWS) {
+            val range = if (r.to == Int.MAX_VALUE) "${r.from}+" else "${r.from}–${r.to}"
+            sb.append('\n').append(range.padEnd(10))
+                .append("+${r.win}".padEnd(4))
+                .append((if (r.loss == 0) "0" else "−${r.loss}").padEnd(5))
+                .append("0".padEnd(4))
+                .append((if (r.streak) "Var" else "Yok").padEnd(5))
+                .append((if (r.underdog) "Var" else "Yok").padEnd(9))
+                .append(if (r.bot) "Gelebilir" else "Gelemez")
+        }
+        return sb.toString()
     }
 }
