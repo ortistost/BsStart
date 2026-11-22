@@ -5,6 +5,10 @@ import java.util.Locale
 
 object SlotStore {
     const val PREFS = "cfg3"
+    const val SET = "bsset"
+    const val DEFAULT_LIMIT = 475
+    const val MIN_LIMIT = 1
+    const val MAX_LIMIT = 3000
     const val SLOTS = 8
     const val CORE = 5
     const val HEADER = "BsStart slots v2"
@@ -21,7 +25,10 @@ object SlotStore {
     fun rectReady(p: SharedPreferences) =
         listOf("ox1", "oy1", "ox2", "oy2").all { p.contains(it) }
 
-    // Çekirdek 5 yuva dolu değilse null. Dolu olan 6-8 ve OCR alanı eklenir.
+    fun totReady(p: SharedPreferences) =
+        listOf("tx1", "ty1", "tx2", "ty2").all { p.contains(it) }
+
+    // Çekirdek 5 yuva dolu değilse null. Dolu olan 6-8, OCR ve TOT alanları eklenir.
     fun format(p: SharedPreferences, screen: String): String? {
         if (!coreReady(p)) return null
         val sb = StringBuilder("$HEADER screen=$screen\n")
@@ -44,12 +51,22 @@ object SlotStore {
                 )
             )
         }
+        if (totReady(p)) {
+            sb.append(
+                String.format(
+                    Locale.US, "TOT x1=%.4f y1=%.4f x2=%.4f y2=%.4f\n",
+                    p.getFloat("tx1", 0f), p.getFloat("ty1", 0f),
+                    p.getFloat("tx2", 0f), p.getFloat("ty2", 0f)
+                )
+            )
+        }
         return sb.toString()
     }
 
     class Parsed(
         val xs: FloatArray, val ys: FloatArray, val colors: IntArray,
-        val have: BooleanArray, val rect: FloatArray?, val screen: String
+        val have: BooleanArray, val rect: FloatArray?, val tot: FloatArray?,
+        val screen: String
     )
 
     class ParseResult(val parsed: Parsed?, val error: String?)
@@ -58,8 +75,16 @@ object SlotStore {
         Regex("""^(\d)\s+.+?\s+x=([0-9.]+)\s+y=([0-9.]+)\s+color=#([0-9A-Fa-f]{6})$""")
     private val RECT_RE =
         Regex("""^OCR\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
+    private val TOT_RE =
+        Regex("""^TOT\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
 
     private fun err(m: String) = ParseResult(null, m)
+
+    private fun rectOf(r: MatchResult): FloatArray? {
+        val v = FloatArray(4) { r.groupValues[it + 1].toFloatOrNull() ?: -1f }
+        if (v.any { it !in 0f..1f } || v[2] <= v[0] || v[3] <= v[1]) return null
+        return v
+    }
 
     fun parse(text: String): ParseResult {
         val lines = text.replace("\r", "").lines().map { it.trim() }.filter { it.isNotEmpty() }
@@ -70,6 +95,7 @@ object SlotStore {
         val xs = FloatArray(SLOTS + 1); val ys = FloatArray(SLOTS + 1)
         val cs = IntArray(SLOTS + 1); val have = BooleanArray(SLOTS + 1)
         var rect: FloatArray? = null
+        var tot: FloatArray? = null
 
         for (line in lines.drop(1)) {
             val m = SLOT_RE.find(line)
@@ -89,17 +115,20 @@ object SlotStore {
             val r = RECT_RE.find(line)
             if (r != null) {
                 if (rect != null) return err("OCR satırı iki kere var")
-                val v = FloatArray(4) { r.groupValues[it + 1].toFloatOrNull() ?: -1f }
-                if (v.any { it !in 0f..1f } || v[2] <= v[0] || v[3] <= v[1])
-                    return err("OCR alanı geçersiz: $line")
-                rect = v
+                rect = rectOf(r) ?: return err("OCR alanı geçersiz: $line")
+                continue
+            }
+            val t = TOT_RE.find(line)
+            if (t != null) {
+                if (tot != null) return err("TOT satırı iki kere var")
+                tot = rectOf(t) ?: return err("TOT alanı geçersiz: $line")
                 continue
             }
             return err("Tanınmayan satır: $line")
         }
         val missing = (1..CORE).filter { !have[it] }
         if (missing.isNotEmpty()) return err("Eksik yuvalar: $missing")
-        return ParseResult(Parsed(xs, ys, cs, have, rect, screen), null)
+        return ParseResult(Parsed(xs, ys, cs, have, rect, tot, screen), null)
     }
 
     fun apply(p: SharedPreferences, d: Parsed): Boolean {
@@ -112,31 +141,37 @@ object SlotStore {
             e.putFloat("ox1", it[0]).putFloat("oy1", it[1])
                 .putFloat("ox2", it[2]).putFloat("oy2", it[3])
         }
+        d.tot?.let {
+            e.putFloat("tx1", it[0]).putFloat("ty1", it[1])
+                .putFloat("tx2", it[2]).putFloat("ty2", it[3])
+        }
         e.putString("screen", d.screen)
         return e.commit()
     }
 }
 
 object TrophyParser {
-    const val MAX_PLAUSIBLE = 2000
+    const val MAX_PLAUSIBLE = 5000
+    const val MAX_TOTAL = 2_000_000
     private val DIGITLIKE = Regex("^[0-9OolI|]{1,5}$")
+    private val TOTALLIKE = Regex("^[0-9OolI|]{1,8}$")
 
-    // Satır satır okur; okunamazsa veya makul değilse null
+    private fun fix(s: String) = s.map {
+        when (it) {
+            'O', 'o' -> '0'
+            'I', 'l', '|' -> '1'
+            else -> it
+        }
+    }.joinToString("")
+
+    // Karakter kupası: satır satır okur; okunamazsa veya makul değilse null
     fun parse(raw: String?): Int? {
         if (raw == null) return null
         val found = ArrayList<Int>()
         for (line in raw.lines()) {
             val s = line.filter { !it.isWhitespace() }
             if (s.isEmpty()) continue
-            val t = if (DIGITLIKE.matches(s))
-                s.map {
-                    when (it) {
-                        'O', 'o' -> '0'
-                        'I', 'l', '|' -> '1'
-                        else -> it
-                    }
-                }.joinToString("")
-            else s
+            val t = if (DIGITLIKE.matches(s)) fix(s) else s
             for (m in Regex("\\d+").findAll(t)) {
                 if (m.value.length > 4) continue
                 val v = m.value.toIntOrNull() ?: continue
@@ -144,5 +179,28 @@ object TrophyParser {
             }
         }
         return found.maxWithOrNull(compareBy<Int>({ it.toString().length }, { it }))
+    }
+
+    // Toplam kupa: "50,200" / "50 200" / "50.200" biçimlerini de kabul eder
+    fun parseTotal(raw: String?): Int? {
+        if (raw == null) return null
+        var best: Int? = null
+        var bestLen = 0
+        for (line in raw.lines()) {
+            val s = line.filter { !it.isWhitespace() && it != ',' && it != '.' }
+            if (s.isEmpty()) continue
+            val t = if (TOTALLIKE.matches(s)) fix(s) else s
+            val cands = if (t.all { it.isDigit() }) listOf(t)
+            else Regex("\\d+").findAll(t).map { it.value }.toList()
+            for (c in cands) {
+                if (c.length > 7) continue
+                val v = c.toIntOrNull() ?: continue
+                if (v > MAX_TOTAL) continue
+                if (c.length > bestLen || (c.length == bestLen && v > (best ?: -1))) {
+                    best = v; bestLen = c.length
+                }
+            }
+        }
+        return best
     }
 }
