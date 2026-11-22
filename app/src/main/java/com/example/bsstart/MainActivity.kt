@@ -36,12 +36,17 @@ class MainActivity : Activity() {
     private val ACC = Color.parseColor("#2979FF")
     private val GREY = Color.parseColor("#34445C")
     private val DANGER = Color.parseColor("#C62828")
+    private val GREEN = Color.parseColor("#2E7D32")
     private val SUB = Color.parseColor("#9FB0C7")
 
     private val h = Handler(Looper.getMainLooper())
     private lateinit var statusTv: TextView
     private lateinit var eventTv: TextView
     private lateinit var stopTv: TextView
+    private lateinit var autoTv: TextView
+    private lateinit var autoInfo: TextView
+    private lateinit var autoBtn: Button
+    private lateinit var readsTv: TextView
     private lateinit var recBox: LinearLayout
     private lateinit var limitEt: EditText
     private lateinit var scaleEt: EditText
@@ -53,6 +58,7 @@ class MainActivity : Activity() {
     private fun shape(color: Int, r: Int) = GradientDrawable().apply {
         setColor(color); cornerRadius = dp(r).toFloat()
     }
+    private fun cfg() = getSharedPreferences(SlotStore.PREFS, MODE_PRIVATE)
     private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
     private fun setPrefs() = getSharedPreferences(SlotStore.SET, MODE_PRIVATE)
 
@@ -123,6 +129,55 @@ class MainActivity : Activity() {
         say("Kopyalandı")
     }
 
+    private fun autoOn() = SlotStore.autoTrophy(setPrefs(), cfg())
+
+    private fun refreshAuto() {
+        val on = autoOn()
+        val lim = setPrefs().getInt("limit", SlotStore.DEFAULT_LIMIT)
+        autoTv.text = "Otomatik kupa: " + if (on) "AÇIK" else "kapalı"
+        autoTv.setTextColor(if (on) Color.parseColor("#00E676") else Color.WHITE)
+        autoBtn.text = if (on) "Kapat" else "Aç"
+        autoBtn.background = shape(if (on) DANGER else GREEN, 12)
+        autoInfo.text = if (on)
+            "Karakter kupası $lim ve üstüne çıkınca Savaşçılar → Karakter → Seç yapılır. ${lim - 1} ve altında karakter değişmez."
+        else
+            "Kapalıyken karakter hiç değişmez, sadece maç döngüsü çalışır."
+    }
+
+    private fun toggleAuto() {
+        val sp = setPrefs()
+        if (autoOn()) {
+            sp.edit().putBoolean("atrophy", false).apply()
+            say("Otomatik kupa kapatıldı")
+        } else {
+            val parsed = SlotStore.parse(SlotStore.PRESET).parsed
+            val n = if (parsed != null) SlotStore.fillMissing(cfg(), parsed, sp) else 0
+            sp.edit().putBoolean("atrophy", true).apply()
+            if (n > 0) ServiceBridge.service?.onExternalLoad()
+            syncFields()
+            say(if (n > 0) "Otomatik kupa açıldı, hazır ayardan $n öğe eklendi" else "Otomatik kupa açıldı")
+        }
+        refreshAuto()
+    }
+
+    private fun loadPreset() {
+        AlertDialog.Builder(this)
+            .setTitle("Hazır ayarı baştan yükle")
+            .setMessage("Mevcut yuvalar, okuma alanı ve ayarlar silinip hazır ayarla değiştirilir. Devam edilsin mi?")
+            .setPositiveButton("Evet") { _, _ ->
+                val parsed = SlotStore.parse(SlotStore.PRESET).parsed
+                if (parsed == null) { say("Hazır ayar okunamadı"); return@setPositiveButton }
+                SlotStore.apply(cfg(), parsed, setPrefs())
+                setPrefs().edit().putBoolean("atrophy", true).apply()
+                ServiceBridge.service?.onExternalLoad()
+                syncFields()
+                refreshAuto()
+                say("Hazır ayar yüklendi, otomatik kupa açık")
+            }
+            .setNegativeButton("İptal", null)
+            .show()
+    }
+
     private fun refreshStatus() {
         val s = ServiceBridge.service
         statusTv.text = when {
@@ -137,16 +192,18 @@ class MainActivity : Activity() {
         val st = getSharedPreferences("bsstat", MODE_PRIVATE)
         eventTv.text = "Son olay: " + (st.getString("ev", null) ?: "-")
         stopTv.text = "Son durma sebebi: " + (st.getString("stop", null) ?: "-")
+        val raw = st.getString("reads", "") ?: ""
+        readsTv.text = if (raw.isEmpty()) "(henüz okuma yok)" else raw.lines().reversed().joinToString("\n")
     }
 
     private fun loadText(t: String) {
         val res = SlotStore.parse(t)
         val p = res.parsed
         if (p == null) { say("Hata: ${res.error}"); return }
-        val prefs = getSharedPreferences(SlotStore.PREFS, MODE_PRIVATE)
-        val ok = SlotStore.apply(prefs, p, setPrefs())
+        val ok = SlotStore.apply(cfg(), p, setPrefs())
         ServiceBridge.service?.onExternalLoad()
         syncFields()
+        refreshAuto()
         say(if (ok) "Yüklendi" else "Yükleme başarısız")
         refreshStatus()
     }
@@ -210,6 +267,7 @@ class MainActivity : Activity() {
         refreshStatus()
         refreshRecords()
         syncFields()
+        refreshAuto()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -245,7 +303,7 @@ class MainActivity : Activity() {
         eventTv = body("", 12f, SUB).apply { setPadding(0, dp(6), 0, 0) }
         stopTv = body("", 12f, SUB).apply { setPadding(0, dp(2), 0, 0) }
         st.addView(statusTv); st.addView(eventTv); st.addView(stopTv)
-        runBtn = btn("Döngüyü başlat", Color.parseColor("#2E7D32")) {
+        runBtn = btn("Döngüyü başlat", GREEN) {
             val s = ServiceBridge.service
             if (s == null) say("Servis kapalı, önce erişilebilirliği aç")
             else s.toggleLoopExternal()
@@ -267,6 +325,29 @@ class MainActivity : Activity() {
             )
         })
         col.addView(st)
+
+        // Otomatik kupa
+        val ac = card()
+        ac.addView(heading("OTOMATİK KUPA"))
+        val arow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            layoutParams = lp(8)
+        }
+        autoTv = body("Otomatik kupa", 15f).apply {
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        autoBtn = Button(this).apply {
+            isAllCaps = false; setTextColor(Color.WHITE); textSize = 14f
+            layoutParams = LinearLayout.LayoutParams(dp(96), dp(44))
+            setOnClickListener { toggleAuto() }
+        }
+        arow.addView(autoTv); arow.addView(autoBtn)
+        ac.addView(arow)
+        autoInfo = body("", 12f, SUB).apply { setPadding(0, dp(8), 0, 0) }
+        ac.addView(autoInfo)
+        ac.addView(btn("Hazır ayarı baştan yükle", GREY) { loadPreset() })
+        col.addView(ac)
 
         // Ayarlar
         val sc = card()
@@ -291,6 +372,7 @@ class MainActivity : Activity() {
             } else {
                 if (sp.getInt("limit", -1) != v) sp.edit().putInt("limit", v).apply()
                 showLimit()
+                refreshAuto()
             }
         }
 
@@ -341,6 +423,16 @@ class MainActivity : Activity() {
         })
         pb.addView(allRow)
         col.addView(pb)
+
+        // Son okumalar
+        val rd = card()
+        rd.addView(heading("SON OKUMALAR (en yeni üstte)"))
+        readsTv = body("", 12f, SUB).apply {
+            typeface = Typeface.MONOSPACE; setTextIsSelectable(true); setPadding(0, dp(8), 0, 0)
+        }
+        rd.addView(readsTv)
+        rd.addView(btn("Yenile", GREY) { refreshStatus() })
+        col.addView(rd)
 
         // Kupa tablosu
         val tb = card()
