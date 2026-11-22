@@ -49,7 +49,7 @@ object ServiceBridge {
 class StartService : AccessibilityService() {
 
     private enum class Phase { LOOP, READING, SWITCH }
-    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, CLIP, SCREEN, HELP, CROSS, TROPHY }
+    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, CLIP, SCREEN, HELP, CROSS, TROPHY, SAVE }
 
     private lateinit var wm: WindowManager
     private val ui = Handler(Looper.getMainLooper())
@@ -57,13 +57,13 @@ class StartService : AccessibilityService() {
     private val sets by lazy { getSharedPreferences(SlotStore.SET, MODE_PRIVATE) }
     private val logPrefs by lazy { getSharedPreferences("bslog", MODE_PRIVATE) }
     private val prefListener =
-        SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refreshMarkers(); updatePill() }
+        SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refreshMarkers(); updateTotUi() }
     private val setListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             ui.post {
                 when (key) {
                     "scale" -> rebuildPanel()
-                    "ttot" -> { ensureScan(); updatePill() }
+                    "ttot" -> { ensureScan(); updateTotUi() }
                     "limit" -> log("Kupa sınırı: ${limit()}")
                 }
             }
@@ -74,6 +74,8 @@ class StartService : AccessibilityService() {
     private fun scale() = sets.getFloat("scale", 1f).coerceIn(0.5f, 2f)
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun d(v: Int) = max(1, (v * resources.displayMetrics.density * scale()).toInt())
+    private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
+    private fun bkPrefs() = getSharedPreferences(SlotStore.BACKUP, MODE_PRIVATE)
 
     private var panel: View? = null
     private var panelLp: WindowManager.LayoutParams? = null
@@ -81,8 +83,6 @@ class StartService : AccessibilityService() {
     private var mainItem: Item? = null
     private var eyeItem: Item? = null
     private var totItem: Item? = null
-    private var pill: TextView? = null
-    private var pillLp: WindowManager.LayoutParams? = null
     private var calibLayer: View? = null
     private var markers: MarkerView? = null
     private var markersOn = true
@@ -114,8 +114,7 @@ class StartService : AccessibilityService() {
     // Toplam kupa takibi
     private var totBase: Int? = null
     private var totNow: Int? = null
-    private var totLast: Int? = null
-    private var totRun = 0
+    private val totWin = ArrayList<Int>()
     private var totBusy = false
     private var totVar = 0
 
@@ -157,8 +156,8 @@ class StartService : AccessibilityService() {
         const val SCAN_PERIOD_MS = 350L      // sistem sınırı ~333 ms olabilir, doğrulanmadı
         const val COMBAT_PERIOD_MS = 200L    // saniyede 5, sabit hız
         const val TAP_MS = 30L
-        const val GATE_FRESH_MS = 3000L
-        const val HOLD_MS = 2500L            // saldırı düğmesi bu kadar görünmezse maç dışı (kalibre edilmedi)
+        const val GATE_FRESH_MS = 5000L      // ekran okuması bu kadar süre gelmezse vuruş durur
+        const val DEAD_HOLD_MS = 25000L      // saldırı düğmesi bu kadar görünmezse maç dışı (kalibre edilmedi)
         const val ENTER_HITS = 2
         const val SLOT_COOLDOWN_MS = 3000L
         const val CONFIRM_SCANS = 3
@@ -166,7 +165,7 @@ class StartService : AccessibilityService() {
         const val HUE_TOL = 20f              // kalibre edilmedi
         const val SAMPLE_RADIUS = 3
         const val LABEL_MS = 3000L
-        const val FOREIGN_PKG_MS = 15000L
+        const val FOREIGN_PKG_MS = 4000L
         const val STUCK_MS = 120000L
         const val LOG_LINES = 150
 
@@ -186,7 +185,6 @@ class StartService : AccessibilityService() {
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         sets.registerOnSharedPreferenceChangeListener(setListener)
         showMarkers()
-        showPill()
         showPanel(d(8), d(24))
         ServiceBridge.service = this
         resetTotal()
@@ -210,7 +208,6 @@ class StartService : AccessibilityService() {
             panel?.requestLayout()
             clampPanel()
             markers?.invalidate()
-            placePill()
         }
         ui.postDelayed(fix, 400)
         ui.postDelayed(fix, 1200)
@@ -226,7 +223,6 @@ class StartService : AccessibilityService() {
         removeView(calibLayer); calibLayer = null
         removeView(panel); panel = null
         removeView(markers); markers = null
-        removeView(pill); pill = null
         recognizer?.close(); recognizer = null
         super.onDestroy()
     }
@@ -247,7 +243,7 @@ class StartService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    // --- Halkalar ve okuma çerçeveleri: dokunmayı geçirir ---
+    // --- Halkalar, okuma çerçeveleri ve toplam kupa yazısı: dokunmayı geçirir ---
 
     private inner class MarkerView(ctx: Context) : View(ctx) {
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -257,6 +253,14 @@ class StartService : AccessibilityService() {
             textSize = dp(18).toFloat(); textAlign = Paint.Align.CENTER
             typeface = Typeface.DEFAULT_BOLD
             setShadowLayer(5f, 0f, 0f, Color.BLACK)
+        }
+        private val info = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
+            color = Color.WHITE
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+        }
+        private val infoBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL; color = Color.parseColor("#99101820")
         }
         private val loc = IntArray(2)
 
@@ -275,22 +279,54 @@ class StartService : AccessibilityService() {
             c.drawText(label, (l + rr) / 2f, t - dp(6), txt)
         }
 
+        // Toplam kupa: çerçevenin altında "50200 (+200)" ve "50000 → 50200"
+        private fun drawTotal(c: Canvas, b: Rect) {
+            val pad = dp(5).toFloat()
+            val top = prefs.getFloat("ty1", 0f) * b.height() - loc[1] - pad
+            val bottom = prefs.getFloat("ty2", 0f) * b.height() - loc[1] + pad
+            val cx = (prefs.getFloat("tx1", 0f) + prefs.getFloat("tx2", 0f)) / 2f * b.width() - loc[0]
+            val base = totBase
+            val now = totNow
+            val l1 = if (base == null || now == null) "…" else {
+                val dl = now - base
+                "$now (${if (dl >= 0) "+$dl" else "$dl"})"
+            }
+            val l2 = if (base == null || now == null) "… → …" else "$base → $now"
+            val ts = dp(14) * scale().coerceIn(0.8f, 1.4f)
+            info.textSize = ts
+            val gap = ts * 1.3f
+            var y1 = bottom + ts * 1.4f
+            var y2 = y1 + gap
+            if (y2 + ts * 0.6f > height) {            // altta yer yoksa çerçevenin üstüne
+                y2 = top - ts * 1.8f
+                y1 = y2 - gap
+            }
+            val w = max(info.measureText(l1), info.measureText(l2)) + dp(16)
+            c.drawRoundRect(RectF(cx - w / 2f, y1 - ts * 1.1f, cx + w / 2f, y2 + ts * 0.5f),
+                dp(8).toFloat(), dp(8).toFloat(), infoBg)
+            c.drawText(l1, cx, y1, info)
+            c.drawText(l2, cx, y2, info)
+        }
+
         override fun onDraw(c: Canvas) {
             getLocationOnScreen(loc)
             val b = screenBounds()
-            val r = dp(24).toFloat()
-            for (i in 1..SLOTS) {
-                if (!slotReady(i)) continue
-                val cx = prefs.getFloat("x$i", 0f) * b.width() - loc[0]
-                val cy = prefs.getFloat("y$i", 0f) * b.height() - loc[1]
-                ring.color = RING_COLORS[i]
-                txt.color = RING_COLORS[i]
-                c.drawCircle(cx, cy, r, ring)
-                c.drawText(i.toString(), cx, cy - r - dp(6), txt)
+            if (markersOn) {
+                val r = dp(24).toFloat()
+                for (i in 1..SLOTS) {
+                    if (!slotReady(i)) continue
+                    val cx = prefs.getFloat("x$i", 0f) * b.width() - loc[0]
+                    val cy = prefs.getFloat("y$i", 0f) * b.height() - loc[1]
+                    ring.color = RING_COLORS[i]
+                    txt.color = RING_COLORS[i]
+                    c.drawCircle(cx, cy, r, ring)
+                    c.drawText(i.toString(), cx, cy - r - dp(6), txt)
+                }
+                val lab = readLabel
+                frame(c, b, "o", Color.WHITE, if (lab == null) "OKU" else "OKU ($lab)")
+                frame(c, b, "t", Color.parseColor("#FFD600"), "TOPLAM")
             }
-            val lab = readLabel
-            frame(c, b, "o", Color.WHITE, if (lab == null) "OKU" else "OKU ($lab)")
-            frame(c, b, "t", Color.parseColor("#FFD600"), "TOPLAM")
+            if (totalActive()) drawTotal(c, b)
         }
     }
 
@@ -312,10 +348,11 @@ class StartService : AccessibilityService() {
 
     private fun refreshMarkers() { ui.post { markers?.invalidate() } }
 
+    // Göz: sadece halkaları ve çerçeveleri gizler, toplam kupa yazısı kalır
     private fun toggleMarkers() {
         markersOn = !markersOn
-        markers?.visibility = if (markersOn) View.VISIBLE else View.INVISIBLE
         eyeItem?.iv?.icon = if (markersOn) Ic.EYE_ON else Ic.EYE_OFF
+        markers?.invalidate()
         toast(if (markersOn) "Halkalar gösteriliyor" else "Halkalar gizli")
     }
 
@@ -332,96 +369,48 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // --- Toplam kupa göstergesi ---
-
-    private fun showPill() {
-        val t = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#CC101820"))
-                cornerRadius = dp(12).toFloat()
-            }
-            visibility = View.GONE
-        }
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = dp(4)
-        }
-        pill = t
-        pillLp = lp
-        wm.addView(t, lp)
-    }
-
-    // Okuma alanlarından biri üst banda denk geliyorsa yazı alta alınır (ekran görüntüsüne girmesin)
-    private fun placePill() {
-        val t = pill ?: return
-        val lp = pillLp ?: return
-        val b = screenBounds()
-        val band = d(48).toFloat()
-        var clash = false
-        for (p in listOf("o", "t")) {
-            if (prefs.contains("${p}y1") && prefs.getFloat("${p}y1", 1f) * b.height() < band) clash = true
-        }
-        lp.gravity = (if (clash) Gravity.BOTTOM else Gravity.TOP) or Gravity.CENTER_HORIZONTAL
-        lp.y = d(4)
-        try { wm.updateViewLayout(t, lp) } catch (_: Exception) {}
-    }
+    // --- Toplam kupa ---
 
     private fun totalActive() =
         panelShown && sets.getBoolean("ttot", false) && SlotStore.totReady(prefs)
 
     private fun resetTotal() {
-        totBase = null; totNow = null; totLast = null; totRun = 0
-        updatePill()
+        totBase = null; totNow = null; totWin.clear()
+        updateTotUi()
     }
 
-    private fun updatePill() {
+    private fun updateTotUi() {
         ui.post {
             val on = totalActive()
             totItem?.iv?.fill = Color.parseColor(if (on) "#FFB300" else "#795548")
-            val t = pill ?: return@post
-            t.visibility = if (on) View.VISIBLE else View.GONE
-            if (!on) return@post
-            t.textSize = 13f * scale()
-            val b = totBase
-            val n = totNow
-            t.text = if (b == null || n == null) "[… → …]" else {
-                val dl = n - b
-                "[$b → $n (${if (dl >= 0) "+$dl" else "$dl"})]"
-            }
-            placePill()
+            markers?.invalidate()
         }
     }
 
-    // Lobi görünürken (Maça gir rengi) toplam alanını okur; aynı sayı ardışık gelince günceller
+    // Her taramada toplam alanını okur; son 6 okumada aynı değer 3 kez çıkınca günceller
     private fun readTotal(bmp: Bitmap) {
         if (totBusy) return
-        if (slotReady(PLAY) && !hit(PLAY, bmp)) return
         val crop = cropRect(bmp, "t", totVar++ % 3) ?: return
         totBusy = true
         recognize(crop) { raw ->
             totBusy = false
             val v = TrophyParser.parseTotal(raw)
-            if (v == null) {
-                totRun = 0; totLast = null
-            } else {
-                if (v == totLast) totRun++ else { totLast = v; totRun = 1 }
+            if (v != null) {
+                totWin.add(v)
+                while (totWin.size > 6) totWin.removeAt(0)
+                val counts = totWin.groupingBy { it }.eachCount()
+                var best: Int? = null
+                var bc = 0
+                for (x in totWin) {
+                    val c = counts[x] ?: 0
+                    if (c >= bc) { best = x; bc = c }      // eşitlikte en yeni olan kazanır
+                }
                 val cur = totNow
-                val need = if (cur != null && abs(v - cur) > 1000) 5 else 2
-                if (totRun >= need) {
-                    if (totBase == null) totBase = v
-                    totNow = v
-                    updatePill()
+                val need = if (best != null && cur != null && abs(best - cur) > 1000) 5 else 3
+                if (best != null && bc >= need && best != cur) {
+                    if (totBase == null) totBase = best
+                    totNow = best
+                    updateTotUi()
                 }
             }
         }
@@ -558,6 +547,14 @@ class StartService : AccessibilityService() {
                     c.drawRect(cx - r * 0.1f, cy + r * 0.3f, cx + r * 0.1f, cy + r * 0.65f, solid)
                     c.drawRect(cx - r * 0.5f, cy + r * 0.65f, cx + r * 0.5f, cy + r * 0.85f, solid)
                 }
+                Ic.SAVE -> {
+                    c.drawRoundRect(
+                        RectF(cx - r * 0.8f, cy - r * 0.8f, cx + r * 0.8f, cy + r * 0.8f),
+                        corner, corner, line
+                    )
+                    c.drawRect(cx - r * 0.45f, cy - r * 0.8f, cx + r * 0.35f, cy - r * 0.2f, solid)
+                    c.drawRect(cx - r * 0.5f, cy + r * 0.15f, cx + r * 0.5f, cy + r * 0.8f, solid)
+                }
             }
         }
     }
@@ -605,6 +602,7 @@ class StartService : AccessibilityService() {
         val area = Item(Ic.SCREEN, Color.parseColor("#00ACC1"), Color.WHITE, 28, "Alan seç")
         val live = Item(Ic.HELP, Color.parseColor("#FDD835"), Color.BLACK, 28, "Test oku")
         val tot = Item(Ic.TROPHY, Color.parseColor("#795548"), Color.WHITE, 28, "Toplam")
+        val save = Item(Ic.SAVE, Color.parseColor("#2E7D32"), Color.WHITE, 28, "Kaydet")
         val off = Item(Ic.CROSS, Color.BLACK, Color.parseColor("#FF1744"), 28, "Gizle")
         mainItem = main
         eyeItem = hide
@@ -619,7 +617,7 @@ class StartService : AccessibilityService() {
                 setStroke(dp(1), Color.parseColor("#66FFFFFF"))
             }
             setPadding(d(6), d(4), d(6), d(6))
-            for (item in listOf(handle, main, calib, del, undo, hide, copy, area, live, tot, off))
+            for (item in listOf(handle, main, calib, del, undo, hide, copy, area, live, tot, save, off))
                 addView(item.col)
         }
         val root = CappedScroll(this).apply {
@@ -677,23 +675,29 @@ class StartService : AccessibilityService() {
         live.iv.setOnClickListener { if (!cancelPick()) liveRead() }
         tot.iv.setOnClickListener { if (!cancelPick()) onTotalTap() }
         tot.iv.setOnLongClickListener { if (!cancelPick()) selectRect("t"); true }
+        save.iv.setOnClickListener { if (!cancelPick()) saveRecord() }
         off.iv.setOnClickListener { if (!cancelPick()) hidePanel() }
 
         wm.addView(root, lp)
         panel = root
         panelLp = lp
         updateMainColor()
-        updatePill()
+        updateTotUi()
         root.post { clampPanel() }
     }
 
     // Boyut ayarı değişince paneli aynı yerde yeniden kurar
     private fun rebuildPanel() {
-        val x = panelLp?.x ?: d(8)
-        val y = panelLp?.y ?: d(24)
-        removeView(panel); panel = null
-        showPanel(x, y)
-        ui.postDelayed({ clampPanel() }, 300)
+        try {
+            val x = panelLp?.x ?: d(8)
+            val y = panelLp?.y ?: d(24)
+            removeView(panel); panel = null
+            showPanel(x, y)
+            ui.postDelayed({ clampPanel() }, 300)
+            log("Panel yeniden kuruldu (boyut x${String.format(java.util.Locale.US, "%.2f", scale())})")
+        } catch (e: Exception) {
+            log("Panel kurulamadı: ${e.javaClass.simpleName} ${e.message}")
+        }
     }
 
     private fun clampPanel() {
@@ -737,10 +741,13 @@ class StartService : AccessibilityService() {
         panelShown = v
         if (!v) { cancelPick(); haltLoop() }
         panel?.visibility = if (v) View.VISIBLE else View.GONE
-        markers?.visibility = if (v && markersOn) View.VISIBLE else View.INVISIBLE
-        if (v) resetTotal()
-        updatePill()
-        if (v) ensureScan()
+        markers?.visibility = if (v) View.VISIBLE else View.INVISIBLE
+        if (v) {
+            restoreBackupIfAny()
+            resetTotal()
+            ensureScan()
+        }
+        updateTotUi()
         log(if (v) "Panel gösterildi, toplam kupa sıfırlandı" else "Panel gizlendi, döngü durduruldu")
     }
 
@@ -751,11 +758,85 @@ class StartService : AccessibilityService() {
         toast("Panel gizlendi. Geri açmak için uygulamadaki düğme.")
     }
 
+    // Uygulamadan: eski yuvaları yedekler, temizler, varsayılan yerde yeni panel açar
+    fun openFresh() {
+        ui.post {
+            try {
+                cancelPick()
+                haltLoop()
+                val bk = bkPrefs()
+                if (!bk.getBoolean("has", false)) {
+                    val e = bk.edit().clear()
+                    SlotStore.copyInto(prefs.all, e)
+                    e.putBoolean("has", true).commit()
+                }
+                prefs.edit().clear().commit()
+                undoSnap = null
+                nextSlot = 1
+                markersOn = true
+                panelShown = true
+                resetTotal()
+                removeView(panel); panel = null
+                showPanel(d(8), d(24))
+                markers?.visibility = View.VISIBLE
+                refreshMarkers()
+                ensureScan()
+                log("Sıfırdan panel açıldı, eski yuvalar yedeğe alındı")
+                toast("Yeni panel açıldı. Gizle deyip uygulamadan tekrar açarsan eski yuvalar geri gelir.")
+            } catch (e: Exception) {
+                log("Sıfırdan açma hatası: ${e.javaClass.simpleName} ${e.message}")
+            }
+        }
+    }
+
+    private fun restoreBackupIfAny() {
+        val bk = bkPrefs()
+        if (!bk.getBoolean("has", false)) return
+        val b = screenBounds()
+        // Yeni panelde yapılanlar kaybolmasın: otomatik Kayıt olarak sakla
+        SlotStore.format(prefs, "${b.width()}x${b.height()}", sets)?.let {
+            val n = SlotStore.recAdd(recPrefs(), it)
+            log("Sıfırdan paneldeki yuvalar Kayıt $n olarak saklandı")
+        }
+        val e = prefs.edit().clear()
+        SlotStore.copyInto(bk.all, e, "has")
+        e.commit()
+        bk.edit().clear().commit()
+        nextSlot = 1
+        undoSnap = null
+        refreshMarkers()
+        toast("Önceki yuvalar geri geldi")
+    }
+
+    // Uygulamadan bir kayıt yüklenince
+    fun onExternalLoad() {
+        ui.post {
+            haltLoop()
+            undoSnap = null
+            nextSlot = 1
+            resetTotal()
+            refreshMarkers()
+            ensureScan()
+            log("Uygulamadan kayıt yüklendi")
+        }
+    }
+
     private fun onTotalTap() {
         if (!SlotStore.totReady(prefs)) { selectRect("t"); return }
         val on = !sets.getBoolean("ttot", false)
         sets.edit().putBoolean("ttot", on).apply()
         toast(if (on) "Toplam kupa takibi açık" else "Toplam kupa takibi kapalı")
+    }
+
+    private fun saveRecord() {
+        val b = screenBounds()
+        val text = SlotStore.format(prefs, "${b.width()}x${b.height()}", sets)
+        if (text == null) {
+            val have = (1..SlotStore.CORE).count { slotReady(it) }
+            toast("$have/${SlotStore.CORE} çekirdek yuva dolu, kaydedilmedi"); return
+        }
+        val n = SlotStore.recAdd(recPrefs(), text)
+        toast("Kayıt $n kaydedildi (uygulamada Kayıtlar bölümünde)")
     }
 
     // --- Yuvalar ---
@@ -803,7 +884,7 @@ class StartService : AccessibilityService() {
 
     private fun copySlots() {
         val b = screenBounds()
-        val text = SlotStore.format(prefs, "${b.width()}x${b.height()}")
+        val text = SlotStore.format(prefs, "${b.width()}x${b.height()}", sets)
         if (text == null) {
             val have = (1..SlotStore.CORE).count { slotReady(it) }
             toast("$have/${SlotStore.CORE} çekirdek yuva dolu, kopyalanmadı"); return
@@ -1045,7 +1126,8 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // Maçtayken saldırı düğmesine saniyede 5 basış, sabit hız, ekran okumasından bağımsız
+    // Maçtayken saldırı düğmesine saniyede 5 basış, sabit hız, ekran okumasından bağımsız.
+    // Düğme görünmese bile (ölüm) maç sonu düğmesi görünene kadar basmaya devam eder.
     private val combatTick = object : Runnable {
         override fun run() {
             if (!running) { combatRunning = false; return }
@@ -1081,19 +1163,23 @@ class StartService : AccessibilityService() {
             hc[2] >= hr[2] * 0.55f && hc[2] <= hr[2] * 1.35f + 0.05f
     }
 
+    // Maça girmek için saldırı düğmesi 2 taramada görünmeli. Maçtan çıkış: maç sonu düğmesi
+    // (evaluate içinde) veya düğme DEAD_HOLD_MS boyunca hiç görünmezse.
     private fun updateGate(bmp: Bitmap, now: Long) {
         if (!slotReady(ATTACK)) { inMatch = false; hitStreak = 0; return }
-        lastGateMs = now
         if (attackMatch(bmp)) { hitStreak++; lastAttackSeenMs = now } else hitStreak = 0
         if (!inMatch && hitStreak >= ENTER_HITS) inMatch = true
-        // Renk kısa süre değişip geri dönse de maç sürer; HOLD_MS boyunca hiç görünmezse biter
-        if (inMatch && now - lastAttackSeenMs > HOLD_MS) inMatch = false
+        if (inMatch && now - lastAttackSeenMs > DEAD_HOLD_MS) {
+            inMatch = false
+            log("Saldırı düğmesi ${DEAD_HOLD_MS / 1000} sn görünmedi: maç dışı sayıldı")
+        }
     }
 
     private fun evaluate(bmp: Bitmap) {
         val now = System.currentTimeMillis()
         if (totalActive()) readTotal(bmp)
         if (!running) return
+        lastGateMs = now
         when (phase) {
             Phase.LOOP -> {
                 // Menü düğmeleri maç sırasında da izlenir: biri üst üste görünürse maç bitmiştir
@@ -1101,7 +1187,7 @@ class StartService : AccessibilityService() {
                 val endSeen = MENU_SLOTS.any { streak[it] >= CONFIRM_SCANS }
                 val was = inMatch
                 if (endSeen) {
-                    inMatch = false; hitStreak = 0; lastGateMs = now
+                    inMatch = false; hitStreak = 0
                 } else {
                     updateGate(bmp, now)
                 }
