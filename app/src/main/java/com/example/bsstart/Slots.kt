@@ -10,13 +10,25 @@ object SlotStore {
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
     const val MAX_LIMIT = 3000
-    const val SLOTS = 9
+    const val MIN_SCALE = 0.6f
+    const val MAX_SCALE = 1.25f
+    const val SLOTS = 18          // 1-8 yuvalar, 11-18 = if (1)..if (8)
+    const val IF_BASE = 10
     const val HEADER = "BsStart slots v2"
     val REQUIRED = intArrayOf(1, 2, 4, 5)
     val NAMES = arrayOf(
         "", "Maça gir", "Saldırı", "Devam 1", "Devam 2", "Çıkış",
-        "Savaşçılar", "Karakter", "Seç", "Koşul"
+        "Savaşçılar", "Karakter", "Seç", "", "",
+        "if (1)", "if (2)", "if (3)", "if (4)", "if (5)", "if (6)", "if (7)", "if (8)"
     )
+    val BUTTONS = listOf(
+        "move" to "Taşı", "mini" to "Küçült / Büyült", "main" to "Başlat / Durdur",
+        "calib" to "Yuva kaydet", "if" to "If", "del" to "Hepsini sil", "undo" to "Geri al",
+        "eye" to "Halkalar", "area" to "Alan seç", "live" to "Test oku",
+        "tot" to "Toplam", "save" to "Kaydet", "off" to "Gizle"
+    )
+
+    fun btnOn(sets: SharedPreferences, key: String) = sets.getBoolean("btn_$key", true)
 
     fun ready(p: SharedPreferences, i: Int) =
         p.contains("c$i") && p.getFloat("x$i", -1f) >= 0f
@@ -65,7 +77,7 @@ object SlotStore {
                 String.format(
                     Locale.US, "SET limit=%d scale=%.2f tot=%d\n",
                     sets.getInt("limit", DEFAULT_LIMIT).coerceIn(MIN_LIMIT, MAX_LIMIT),
-                    sets.getFloat("scale", 1f).coerceIn(0.5f, 2f),
+                    sets.getFloat("scale", 1f).coerceIn(MIN_SCALE, MAX_SCALE),
                     if (sets.getBoolean("ttot", false)) 1 else 0
                 )
             )
@@ -82,7 +94,7 @@ object SlotStore {
     class ParseResult(val parsed: Parsed?, val error: String?)
 
     private val SLOT_RE =
-        Regex("""^(\d)\s+.+?\s+x=([0-9.]+)\s+y=([0-9.]+)\s+color=#([0-9A-Fa-f]{6})$""")
+        Regex("""^(\d{1,2})\s+.+?\s+x=([0-9.]+)\s+y=([0-9.]+)\s+color=#([0-9A-Fa-f]{6})$""")
     private val RECT_RE =
         Regex("""^OCR\s+x1=([0-9.]+)\s+y1=([0-9.]+)\s+x2=([0-9.]+)\s+y2=([0-9.]+)$""")
     private val TOT_RE =
@@ -119,8 +131,9 @@ object SlotStore {
         for (line in lines.drop(1)) {
             val m = SLOT_RE.find(line)
             if (m != null) {
-                val i = m.groupValues[1].toInt()
-                if (i !in 1..SLOTS) return err("Geçersiz yuva numarası: $line")
+                var i = m.groupValues[1].toInt()
+                if (i == 9) i = IF_BASE + 2          // eski "Koşul" = if (2)
+                if (i !in 1..SLOTS || i == IF_BASE) return err("Geçersiz yuva numarası: $line")
                 if (have[i]) return err("Yuva $i iki kere var")
                 val x = m.groupValues[2].toFloatOrNull()
                 val y = m.groupValues[3].toFloatOrNull()
@@ -149,8 +162,8 @@ object SlotStore {
                 val lim = s.groupValues[1].toIntOrNull()
                 val sc = s.groupValues[2].toFloatOrNull()
                 if (lim == null || lim !in MIN_LIMIT..MAX_LIMIT) return err("Kupa sınırı geçersiz: $line")
-                if (sc == null || sc < 0.5f || sc > 2f) return err("Panel boyutu 0.5-2 olmalı: $line")
-                set = Triple(lim, sc, s.groupValues[3] == "1")
+                if (sc == null) return err("Panel boyutu geçersiz: $line")
+                set = Triple(lim, sc.coerceIn(MIN_SCALE, MAX_SCALE), s.groupValues[3] == "1")
                 continue
             }
             return err("Tanınmayan satır: $line")
