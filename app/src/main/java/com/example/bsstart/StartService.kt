@@ -46,7 +46,7 @@ object ServiceBridge {
 class StartService : AccessibilityService() {
 
     private enum class Phase { LOOP, READING, SWITCH }
-    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW, IF }
+    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW, IF, COLORS }
 
     private lateinit var wm: WindowManager
     private val ui = Handler(Looper.getMainLooper())
@@ -55,7 +55,7 @@ class StartService : AccessibilityService() {
     private val stat by lazy { getSharedPreferences("bsstat", MODE_PRIVATE) }
     private val prefListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-            refreshMarkers(); updateTotUi(); updateLabels()
+            refreshMarkers(); updateTotUi(); updateLabels(); refreshColors()
         }
     private val setListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -85,6 +85,9 @@ class StartService : AccessibilityService() {
     private var miniItem: Item? = null
     private var calibItem: Item? = null
     private var ifItem: Item? = null
+    private var colorsItem: Item? = null
+    private var colorsLayer: View? = null
+    private var colorsLp: WindowManager.LayoutParams? = null
     private val itemMap = LinkedHashMap<String, Item>()
     private val iconViews = ArrayList<View>()
     private var calibLayer: View? = null
@@ -213,6 +216,7 @@ class StartService : AccessibilityService() {
             panel?.requestLayout()
             clampPanel()
             markers?.invalidate()
+            if (colorsLayer != null) rebuildColors()
         }
         ui.postDelayed(fix, 400)
         ui.postDelayed(fix, 1200)
@@ -227,6 +231,7 @@ class StartService : AccessibilityService() {
         try { sets.unregisterOnSharedPreferenceChangeListener(setListener) } catch (_: Exception) {}
         removeView(calibLayer); calibLayer = null
         removeView(panel); panel = null
+        removeView(colorsLayer); colorsLayer = null
         removeView(markers); markers = null
         recognizer?.close(); recognizer = null
         super.onDestroy()
@@ -559,6 +564,18 @@ class StartService : AccessibilityService() {
                     val fm = textP.fontMetrics
                     c.drawText("if", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
                 }
+                Ic.COLORS -> {
+                    val cols = intArrayOf(
+                        Color.parseColor("#FF5252"), Color.parseColor("#FFEB3B"),
+                        Color.parseColor("#40C4FF"), Color.parseColor("#69F0AE")
+                    )
+                    val sx = floatArrayOf(-1f, 1f, -1f, 1f)
+                    val sy = floatArrayOf(-1f, -1f, 1f, 1f)
+                    for (k in 0 until 4) {
+                        solid.color = cols[k]
+                        c.drawCircle(cx + sx[k] * r * 0.5f, cy + sy[k] * r * 0.5f, r * 0.34f, solid)
+                    }
+                }
                 Ic.CROSS -> {
                     c.drawLine(cx - r * 0.7f, cy - r * 0.7f, cx + r * 0.7f, cy + r * 0.7f, line)
                     c.drawLine(cx + r * 0.7f, cy - r * 0.7f, cx - r * 0.7f, cy + r * 0.7f, line)
@@ -680,18 +697,21 @@ class StartService : AccessibilityService() {
         val tot = Item(Ic.TROPHY, Color.parseColor("#795548"), Color.WHITE, 28, "Toplam")
         val save = Item(Ic.SAVE, Color.parseColor("#2E7D32"), Color.WHITE, 28, "Kaydet")
         val off = Item(Ic.CROSS, Color.BLACK, Color.parseColor("#FF1744"), 28, "Gizle")
+        val colorsBtn = Item(Ic.COLORS, Color.parseColor("#37474F"), Color.WHITE, 28, "Renkler")
         mainItem = main
         eyeItem = hide
         totItem = tot
         miniItem = mini
         calibItem = calib
         ifItem = ifb
+        colorsItem = colorsBtn
         hide.iv.icon = if (markersOn) Ic.EYE_ON else Ic.EYE_OFF
         itemMap.clear()
         itemMap["move"] = handle; itemMap["mini"] = mini; itemMap["main"] = main
         itemMap["calib"] = calib; itemMap["if"] = ifb; itemMap["del"] = del
         itemMap["undo"] = undo; itemMap["eye"] = hide; itemMap["area"] = area
         itemMap["live"] = live; itemMap["tot"] = tot; itemMap["save"] = save
+        itemMap["colors"] = colorsBtn
         itemMap["off"] = off
         iconViews.clear()
         iconViews.addAll(itemMap.values.map { it.iv })
@@ -764,15 +784,174 @@ class StartService : AccessibilityService() {
         tot.iv.setOnLongClickListener { if (!cancelPick()) selectRect("t"); true }
         save.iv.setOnClickListener { if (!cancelPick()) saveRecord() }
         off.iv.setOnClickListener { if (!cancelPick()) hidePanel() }
+        colorsBtn.iv.setOnClickListener { if (!cancelPick()) toggleColors() }
 
         wm.addView(root, lp)
         panel = root
         panelLp = lp
+        updateColorsBtn()
         updateMainColor()
         applyVisibility()
         updateLabels()
         updateTotUi()
         root.post { clampPanel() }
+    }
+
+    // --- Renk listesi penceresi ---
+
+    private fun updateColorsBtn() {
+        colorsItem?.iv?.fill = Color.parseColor(if (colorsLayer != null) "#00ACC1" else "#37474F")
+    }
+
+    private fun toggleColors() {
+        if (colorsLayer != null) { closeColors(); return }
+        if (running) {
+            toast("Döngü açıkken renk listesi açılmaz. Önce durdur.")
+            return
+        }
+        openColors()
+    }
+
+    private fun closeColors() {
+        removeView(colorsLayer)
+        colorsLayer = null
+        colorsLp = null
+        updateColorsBtn()
+    }
+
+    private fun refreshColors() {
+        ui.post { if (colorsLayer != null) rebuildColors() }
+    }
+
+    private fun rebuildColors() {
+        removeView(colorsLayer)
+        colorsLayer = null
+        colorsLp = null
+        openColors()
+    }
+
+    private fun openColors() {
+        val v = buildColorsView()
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        placeColors(v, lp)
+        try {
+            wm.addView(v, lp)
+        } catch (_: Exception) {
+            toast("Renk listesi açılamadı")
+            updateColorsBtn()
+            return
+        }
+        colorsLayer = v
+        colorsLp = lp
+        updateColorsBtn()
+    }
+
+    // Panelin sağına koyar, sığmazsa soluna
+    private fun placeColors(v: View, lp: WindowManager.LayoutParams) {
+        val b = screenBounds()
+        v.measure(
+            View.MeasureSpec.makeMeasureSpec(b.width(), View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(b.height(), View.MeasureSpec.AT_MOST)
+        )
+        val w = v.measuredWidth
+        val h = v.measuredHeight
+        val px = panelLp?.x ?: 0
+        val py = panelLp?.y ?: 0
+        val pw = panel?.width ?: 0
+        var x = px + pw + d(6)
+        if (x + w > b.width()) x = px - w - d(6)
+        lp.x = x.coerceIn(0, max(0, b.width() - w))
+        lp.y = py.coerceIn(0, max(0, b.height() - h))
+    }
+
+    private fun buildColorsView(): View {
+        val sc = scale()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#E6101820"))
+                cornerRadius = d(10).toFloat()
+                setStroke(dp(1), Color.parseColor("#66FFFFFF"))
+            }
+            setPadding(d(10), d(8), d(10), d(10))
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        head.addView(TextView(this).apply {
+            text = "Seçilen renkler"
+            textSize = 13f * sc
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = d(16) }
+        })
+        head.addView(TextView(this).apply {
+            text = "Kapat"
+            textSize = 12f * sc
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#B71C1C"))
+                cornerRadius = d(8).toFloat()
+            }
+            setPadding(d(10), d(4), d(10), d(4))
+            setOnClickListener { closeColors() }
+        })
+        box.addView(head)
+
+        for (i in 1..8) {
+            val ok = slotReady(i)
+            val c = if (ok) prefs.getInt("c$i", 0) or (0xFF shl 24) else Color.TRANSPARENT
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, d(5), 0, 0)
+            }
+            row.addView(TextView(this).apply {
+                text = i.toString()
+                textSize = 13f * sc
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(RING_COLORS[i])
+                layoutParams = LinearLayout.LayoutParams(d(16), LinearLayout.LayoutParams.WRAP_CONTENT)
+            })
+            row.addView(TextView(this).apply {
+                text = SlotStore.NAMES[i]
+                textSize = 12f * sc
+                setTextColor(Color.WHITE)
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(d(84), LinearLayout.LayoutParams.WRAP_CONTENT)
+            })
+            row.addView(View(this).apply {
+                background = GradientDrawable().apply {
+                    setColor(c)
+                    cornerRadius = d(5).toFloat()
+                    setStroke(dp(1), if (ok) Color.WHITE else Color.parseColor("#88FFFFFF"))
+                }
+                layoutParams = LinearLayout.LayoutParams(d(24), d(24)).apply {
+                    marginStart = d(8); marginEnd = d(8)
+                }
+            })
+            row.addView(TextView(this).apply {
+                text = if (ok) String.format(java.util.Locale.US, "#%06X", c and 0xFFFFFF) else "kayıtlı değil"
+                textSize = 12f * sc
+                typeface = Typeface.MONOSPACE
+                setTextColor(if (ok) Color.WHITE else Color.parseColor("#9FB0C7"))
+                maxLines = 1
+            })
+            box.addView(row)
+        }
+        return box
     }
 
     private fun toggleMinimize() {
@@ -786,6 +965,7 @@ class StartService : AccessibilityService() {
             val on = SlotStore.btnOn(sets, k) && (!minimized || k in MIN_KEEP)
             item.col.visibility = if (on) View.VISIBLE else View.GONE
         }
+        if (colorsLayer != null && (minimized || !SlotStore.btnOn(sets, "colors"))) closeColors()
         miniItem?.iv?.icon = if (minimized) Ic.GROW else Ic.SHRINK
         miniItem?.tv?.text = if (minimized) "Büyült" else "Küçült"
         panel?.post { panel?.requestLayout(); clampPanel() }
@@ -806,6 +986,7 @@ class StartService : AccessibilityService() {
             val y = panelLp?.y ?: d(24)
             removeView(panel); panel = null
             showPanel(x, y)
+            if (colorsLayer != null) ui.postDelayed({ rebuildColors() }, 350)
             ui.postDelayed({ clampPanel() }, 300)
         } catch (_: Exception) {}
     }
@@ -847,7 +1028,7 @@ class StartService : AccessibilityService() {
 
     fun setPanelVisible(v: Boolean) {
         panelShown = v
-        if (!v) { cancelPick(); haltLoop(); noteStop("Panel gizlendi (elle)") }
+        if (!v) { closeColors(); cancelPick(); haltLoop(); noteStop("Panel gizlendi (elle)") }
         panel?.visibility = if (v) View.VISIBLE else View.GONE
         markers?.visibility = if (v) View.VISIBLE else View.INVISIBLE
         if (v) {
@@ -958,6 +1139,7 @@ class StartService : AccessibilityService() {
     private fun pickPoint(prompt: String, onPoint: (Float, Float) -> Unit) {
         if (calibLayer != null) return
         haltLoop()
+        closeColors()
         toast(prompt)
         val layer = View(this).apply { setBackgroundColor(Color.parseColor("#33000000")) }
         layer.setOnTouchListener { _, e ->
@@ -1155,6 +1337,7 @@ class StartService : AccessibilityService() {
             session++
             resetState()
             needCheck = true
+            closeColors()
             running = true
             setKeepAwake(true)
             ensureScan()
