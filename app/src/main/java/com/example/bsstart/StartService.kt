@@ -226,6 +226,7 @@ class StartService : AccessibilityService() {
         const val SLOT_COOLDOWN_MS = 3000L
         const val CONFIRM_SCANS = 3
         const val COLOR_TOLERANCE = 35
+        const val PLAY_TOLERANCE = 48       // yuva 1 (Maça gir) açık gri yazı rengi: telefonlar arası parlaklık farkı geniş
         const val HUE_TOL = 20f
         const val SAMPLE_RADIUS = 3
         const val LABEL_MS = 3000L
@@ -1757,7 +1758,8 @@ class StartService : AccessibilityService() {
     private fun hit(i: Int, bmp: Bitmap, tol: Int = COLOR_TOLERANCE): Boolean {
         if (!slotReady(i)) return false
         val c = sampleColor(bmp, prefs.getFloat("x$i", 0f), prefs.getFloat("y$i", 0f)) ?: return false
-        return close(c, prefs.getInt("c$i", 0), tol)
+        val t = if (i == PLAY && tol == COLOR_TOLERANCE) PLAY_TOLERANCE else tol
+        return close(c, prefs.getInt("c$i", 0), t)
     }
 
     // Yuvanın rengi görünüyor ve (varsa) if rengi ile if% uyumu da tamam
