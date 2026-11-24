@@ -152,6 +152,10 @@ class StartService : AccessibilityService() {
     private var liveBusy = false
     private var liveStartMs = 0L
 
+    private var awaitPlay = false          // kupa < sınır: yuva 1'e renksiz bas, maç başlayana dek tekrarla
+    private var nextPlayAt = 0L
+    private var seqUntil = 0L              // 3-4-5 dizisi süresince başka karar verme
+    private var seqToken = 0
     private var nifItem: Item? = null
     private var naifItem: Item? = null
     private var lastNifOkMs = 0L
@@ -244,7 +248,7 @@ class StartService : AccessibilityService() {
         const val BRAWLERS = 6
         const val CHARACTER = 7
         const val SELECT = 8
-        val MENU_SLOTS = intArrayOf(1, 3, 4, 5)
+        val MENU_SLOTS = intArrayOf(MENU3)   // renge bakılan tek menü yuvası: 3 (2 saldırı sinyali). 1, 4, 5, 6, 7, 8 körlemesine basılır
         val MIN_KEEP = setOf("move", "mini", "main", "off")
         val RING_COLORS = intArrayOf(
             0, Color.parseColor("#43A047"), Color.parseColor("#E53935"),
@@ -283,7 +287,10 @@ class StartService : AccessibilityService() {
         const val LIVE_TIMEOUT_MS = 12000L  // Test oku en geç bu sürede cevap verir
         const val MIN_FRAMES = 2            // kazanan değer en az bu kadar farklı karede görülmeli
         const val REQUIRED_VOTES = 3
-        const val SWITCH_VOTES = 4          // karakter değiştirmek için gereken oy
+        const val SWITCH_VOTES = 3          // karakter değiştirmek için gereken oy (3 okuma onayı)
+        const val MENU3 = 3
+        const val PLAY_RETRY_MS = 4000L     // yuva 1 körlemesine basıldı ama maç başlamadıysa tekrar basma aralığı
+        const val MENU_GAP_MS = 1000L       // 3 -> 4 -> 5 arası bekleme
         const val SUSPECT_SLACK = 10        // olası kupa aralığının dışında kabul edilen pay
         const val MAX_FAIL_CYCLES = 20
         const val READ_TIMEOUT_MS = 30000L
@@ -481,7 +488,7 @@ class StartService : AccessibilityService() {
                     txt.color = col
                     c.drawCircle(cx, cy, r, ring)
                     dot.color = (col and 0xFFFFFF) or (110 shl 24)   // ortadaki yarı saydam nokta = tam tıklama noktası
-                    c.drawCircle(cx, cy, dp(3).toFloat(), dot)
+                    c.drawCircle(cx, cy, dp(2).toFloat(), dot)
                     val lbl = when {
                         i > NIF_BASE -> "ters ${i - NIF_BASE}"
                         i > IF_BASE -> "if ${i - IF_BASE}"
@@ -974,6 +981,7 @@ class StartService : AccessibilityService() {
                 else -> null
             }
             val nifOk = slotReady(NIF_BASE + i) || aifReady(NIF_BASE + i)
+            val posOnly = i >= BRAWLERS        // 6, 7, 8: renge bakılmaz, sadece yer
             val has = ok || ifOk || aref != null || nifOk
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -994,7 +1002,15 @@ class StartService : AccessibilityService() {
                 maxLines = 1
                 layoutParams = LinearLayout.LayoutParams(d(84), LinearLayout.LayoutParams.WRAP_CONTENT)
             })
-            if (aref != null) {
+            if (posOnly) {
+                row.addView(TextView(this).apply {
+                    text = if (ok) String.format(java.util.Locale.US, "yer %.0f%%, %.0f%% (renksiz)",
+                        prefs.getFloat("x$i", 0f) * 100, prefs.getFloat("y$i", 0f) * 100) else "kayıtlı değil"
+                    textSize = 11f * sc
+                    setTextColor(Color.parseColor("#9FB0C7"))
+                    setPadding(d(8), 0, d(4), 0)
+                })
+            } else if (aref != null) {
                 row.addView(aifThumb(aref))
                 row.addView(TextView(this).apply {
                     text = if (ifOk) "if% + if" else "if%"
@@ -1029,7 +1045,7 @@ class StartService : AccessibilityService() {
                 })
             }
             // Kayıtlı rengin sağında: o noktada ekranda ŞU AN görünen renk (yarım saniyede bir güncellenir)
-            val liveIdx = when { ifOk -> IF_BASE + i; ok -> i; else -> null }
+            val liveIdx = if (posOnly) null else when { ifOk -> IF_BASE + i; ok -> i; else -> null }
             if (liveIdx != null) {
                 val sw = View(this).apply {
                     background = GradientDrawable().apply {
@@ -2040,6 +2056,7 @@ class StartService : AccessibilityService() {
         inMatch = false; hitStreak = 0; missStreak = 0
         phase = Phase.LOOP; needCheck = false; afterSwitch = false
         ocrBusy = false; switchArmed = false; failCycles = 0
+        awaitPlay = false; seqUntil = 0L; seqToken++
         trophyUpper = null
         trophyLow = null
         reads.clear()
@@ -2072,6 +2089,9 @@ class StartService : AccessibilityService() {
             if (!slotReady(PLAY)) {
                 toast("Önce yuva 1'i (Maça gir) kaydet"); return
             }
+            if (!slotReady(MENU3)) {
+                toast("Yuva 3 (Devam 1) şart: maç sonunu o renkten anlıyorum. Önce kaydet"); return
+            }
             session++
             resetState()
             needCheck = true
@@ -2079,6 +2099,9 @@ class StartService : AccessibilityService() {
             running = true
             setKeepAwake(true)
             ensureScan()
+            // Başlangıçta lobideyiz varsayılır: kupa okunur (maçtaysak saldırı sinyali okumayı keser)
+            if (trophyCheckOn()) startReading(System.currentTimeMillis() + 500)
+            else { needCheck = false; playNow(1500L) }
             if (!combatRunning) { combatRunning = true; nextTapAt = 0L; ui.post(combatTick) }
             note("Döngü başlatıldı")
             logRead("başlatıldı: sınır ${limit()}, kupa kontrolü ${if (trophyCheckOn()) "açık" else "kapalı"}, saldırı ${attackRate()}/sn")
@@ -2232,9 +2255,11 @@ class StartService : AccessibilityService() {
             reads.clear()
             if (!inMatch) onMatchStart()
             inMatch = true
+            awaitPlay = false
         }
         if (hitStreak >= ENTER_HITS && !inMatch && phase == Phase.LOOP) {
             inMatch = true
+            awaitPlay = false
             onMatchStart()
         }
 
@@ -2258,6 +2283,12 @@ class StartService : AccessibilityService() {
             if (inMatch) return
         }
 
+        // Okuma sürerken maç sonu ekranı (yuva 3) görünürse okuma bırakılır, 3-4-5 dizisi başlar
+        if (phase == Phase.READING && now >= seqUntil && streak[MENU3] >= CONFIRM_SCANS &&
+            now - lastTapMs[MENU3] >= SLOT_COOLDOWN_MS) {
+            phase = Phase.LOOP; ocrBusy = false; reads.clear()
+            logRead("okuma bırakıldı: maç sonu ekranı (yuva 3) görünüyor")
+        }
         diag(bmp, now)
         when (phase) {
             Phase.LOOP -> loopStep(now)
@@ -2266,18 +2297,46 @@ class StartService : AccessibilityService() {
         }
     }
 
+    // Renge bakılan yuvalar: 2 (saldırı sinyali) ve 3 (maç sonu). Gerisi körlemesine, sırayla basılır.
     private fun loopStep(now: Long) {
-        for (i in MENU_SLOTS) {
-            if (streak[i] < CONFIRM_SCANS || now - lastTapMs[i] < SLOT_COOLDOWN_MS) continue
+        if (now < seqUntil) return
+        if (streak[MENU3] >= CONFIRM_SCANS && now - lastTapMs[MENU3] >= SLOT_COOLDOWN_MS) {
             streak.fill(0)
-            if (i == PLAY && needCheck && trophyCheckOn()) {
-                startReading(now)
-                return
-            }
-            tapSlot(i)
-            if (i != PLAY) needCheck = true
+            startMenuSeq(now)
             return
         }
+        if (awaitPlay && !inMatch && now >= nextPlayAt && slotReady(PLAY)) {
+            tapSlot(PLAY)
+            nextPlayAt = now + PLAY_RETRY_MS
+        }
+    }
+
+    // 3'e bas, 1 sn sonra 4, 1 sn sonra 5; sonra kupa okuması (ya da okuma kapalıysa 1'e bas)
+    private fun startMenuSeq(now: Long) {
+        awaitPlay = false
+        needCheck = true
+        val s = session
+        val tok = ++seqToken
+        seqUntil = now + MENU_GAP_MS * 2 + SETTLE_MS + 500
+        tapSlot(MENU3)
+        note("Maç sonu: 3, 1 sn sonra 4, 1 sn sonra 5")
+        fun live() = running && s == session && tok == seqToken && phase == Phase.LOOP
+        ui.postDelayed({ if (live() && slotReady(4)) tapSlot(4) }, MENU_GAP_MS)
+        ui.postDelayed({ if (live() && slotReady(5)) tapSlot(5) }, MENU_GAP_MS * 2)
+        ui.postDelayed({
+            if (live() && !inMatch) {
+                seqUntil = 0L
+                if (trophyCheckOn()) startReading(System.currentTimeMillis())
+                else { needCheck = false; playNow() }
+            }
+        }, MENU_GAP_MS * 2 + SETTLE_MS)
+    }
+
+    // Yuva 1'e renge bakmadan basılır; maç başlamazsa PLAY_RETRY_MS'de bir tekrarlanır
+    private fun playNow(delayMs: Long = 0L) {
+        awaitPlay = true
+        nextPlayAt = System.currentTimeMillis() + delayMs
+        seqUntil = 0L
     }
 
     // --- Kupa okuma ---
@@ -2296,13 +2355,6 @@ class StartService : AccessibilityService() {
         if (now < settleUntil) return
         if (now - readStartMs > READ_TIMEOUT_MS) { readFailed("Okuma zaman aşımı"); return }
         if (ocrBusy) return
-        if (!hit(PLAY, bmp)) {
-            if (now - lastWaitLogMs > 5000L) {
-                lastWaitLogMs = now
-                logRead("okuma bekliyor: yuva 1 (Maça gir) rengi görünmüyor")
-            }
-            return
-        }
         ocrBusy = true
         val s = session
         // Her karede yalnızca VARIANTS_PER_FRAME varyant okunur (16'sı birden telefonu yavaşlatıyordu)
@@ -2345,6 +2397,7 @@ class StartService : AccessibilityService() {
             toast("$msg: tahmin $up ≤ sınır altı, devam")
             phase = Phase.LOOP; needCheck = false; failCycles = 0
             streak.fill(0)
+            playNow()
             return
         }
         if (failCycles >= MAX_FAIL_CYCLES) {
@@ -2404,6 +2457,7 @@ class StartService : AccessibilityService() {
         if (up < lim) {
             // Tahmin sınırın altında: karakter değişmez, oynamaya devam
             phase = Phase.LOOP; needCheck = false; failCycles = 0
+            playNow()
             return
         }
         // Tahmin sınırı geçmiş olabilir ama okuma tutarsız: tekrar oku
@@ -2433,6 +2487,7 @@ class StartService : AccessibilityService() {
         failCycles = 0
         if (v < lim) {
             phase = Phase.LOOP; needCheck = false; afterSwitch = false
+            playNow()
             return
         }
         if (afterSwitch) {
@@ -2449,16 +2504,16 @@ class StartService : AccessibilityService() {
         stepStartMs = System.currentTimeMillis()
         val s = session
         val tok = ++switchToken
-        note("Karakter değiştiriliyor: ${STEP_DELAY_MS / 1000} sn sonra 6, sonra 7, sonra 8")
-        ui.postDelayed({ if (switchLive(s, tok)) tapSlot(BRAWLERS) }, STEP_DELAY_MS)
-        ui.postDelayed({ if (switchLive(s, tok)) tapSlot(CHARACTER) }, STEP_DELAY_MS * 2)
+        note("Karakter değiştiriliyor: 6 hemen, 5 sn sonra 7, 5 sn sonra 8")
+        tapSlot(BRAWLERS)
+        ui.postDelayed({ if (switchLive(s, tok)) tapSlot(CHARACTER) }, STEP_DELAY_MS)
         ui.postDelayed({
             if (switchLive(s, tok)) {
                 tapSlot(SELECT)
                 afterSwitch = true
                 startReading(System.currentTimeMillis() + SETTLE_MS)
             }
-        }, STEP_DELAY_MS * 3)
+        }, STEP_DELAY_MS * 2)
     }
 
     private fun switchLive(s: Int, tok: Int) =
@@ -2620,13 +2675,19 @@ class StartService : AccessibilityService() {
         abs(Color.green(a) - Color.green(b)) <= tol &&
         abs(Color.blue(a) - Color.blue(b)) <= tol
 
+    // Ortadaki nokta (yarıçap dp(2)) ekran görüntüsüne girse bile renge karışmasın diye
+    // noktanın çevresindeki halkadan ortalama alınır (noktanın kendisi sayılmaz).
     private fun sampleColor(bmp: Bitmap, fx: Float, fy: Float): Int? {
         val cx = (fx * bmp.width).toInt()
         val cy = (fy * bmp.height).toInt()
+        val dotR = dp(2) + 2
+        val rad = dotR + 3
         var r = 0L; var g = 0L; var b = 0L; var n = 0
-        for (yy in cy - SAMPLE_RADIUS..cy + SAMPLE_RADIUS)
-            for (xx in cx - SAMPLE_RADIUS..cx + SAMPLE_RADIUS) {
+        for (yy in cy - rad..cy + rad)
+            for (xx in cx - rad..cx + rad) {
                 if (xx !in 0 until bmp.width || yy !in 0 until bmp.height) continue
+                val dx = xx - cx; val dy = yy - cy
+                if (dx * dx + dy * dy <= dotR * dotR) continue
                 val p = bmp.getPixel(xx, yy)
                 r += Color.red(p); g += Color.green(p); b += Color.blue(p); n++
             }
