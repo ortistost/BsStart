@@ -248,7 +248,7 @@ class StartService : AccessibilityService() {
         const val BRAWLERS = 6
         const val CHARACTER = 7
         const val SELECT = 8
-        val MENU_SLOTS = intArrayOf(MENU3)   // renge bakılan tek menü yuvası: 3 (2 saldırı sinyali). 1, 4, 5, 6, 7, 8 körlemesine basılır
+        val MENU_SLOTS = intArrayOf(3)   // renge bakılan tek menü yuvası: 3 (2 saldırı sinyali). 1, 4, 5, 6, 7, 8 körlemesine basılır
         val MIN_KEEP = setOf("move", "mini", "main", "off")
         val RING_COLORS = intArrayOf(
             0, Color.parseColor("#43A047"), Color.parseColor("#E53935"),
