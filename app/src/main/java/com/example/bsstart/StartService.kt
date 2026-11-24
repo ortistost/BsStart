@@ -47,7 +47,6 @@ object ServiceBridge {
 class StartService : AccessibilityService() {
 
     private enum class Phase { LOOP, READING, SWITCH }
-    private enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW, IF, COLORS, AIF }
 
     // Okuma oyu: hangi değer, hangi ekran karesinden (en az MIN_FRAMES farklı kare gerekir)
     private class Vote(val value: Int, val frame: Int)
@@ -94,6 +93,14 @@ class StartService : AccessibilityService() {
     private fun scale() = sets.getFloat("scale", 1f).coerceIn(SlotStore.MIN_SCALE, SlotStore.MAX_SCALE)
     private fun aifThreshold() = sets.getInt("aifpct", SlotStore.DEFAULT_AIF)
         .coerceIn(SlotStore.MIN_AIF, SlotStore.MAX_AIF)
+    private fun naifThreshold() = sets.getInt("naifpct", SlotStore.DEFAULT_NAIF)
+        .coerceIn(SlotStore.MIN_AIF, SlotStore.MAX_AIF)
+    private fun nifRate() = sets.getFloat("nifrate", SlotStore.DEFAULT_NIF_RATE)
+        .coerceIn(SlotStore.MIN_ATK_RATE, SlotStore.MAX_ATK_RATE)
+    private fun nifPeriodMs(): Long = max(1L, (1000f / nifRate()).toLong())
+    // Renk payı: her kanalda (R, G, B) kabul edilen en büyük fark. Yuva 1 için +13 ek pay (açık gri yazı).
+    private fun ctol() = sets.getInt("ctol", SlotStore.DEFAULT_CTOL)
+        .coerceIn(SlotStore.MIN_CTOL, SlotStore.MAX_CTOL)
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun d(v: Int) = max(1, (v * resources.displayMetrics.density * scale()).toInt())
     private fun recPrefs() = getSharedPreferences(SlotStore.REC, MODE_PRIVATE)
@@ -144,6 +151,29 @@ class StartService : AccessibilityService() {
     private var rectPending = false
     private var liveBusy = false
     private var liveStartMs = 0L
+
+    private var nifItem: Item? = null
+    private var naifItem: Item? = null
+    private var lastNifOkMs = 0L
+    private val targets = HashMap<Int, View>()
+    private val tapTimes = HashMap<Int, ArrayList<Long>>()
+    private var targetSig = ""
+    private class LiveRow(val idx: Int, val sw: View, val tv: TextView, val ref: Int)
+    private val liveRows = ArrayList<LiveRow>()
+    private var liveColBusy = false
+    private var finderLayer: View? = null
+    private var finderLp: WindowManager.LayoutParams? = null
+    private var foundLayer: View? = null
+    private var finderColor = Color.parseColor("#FF0000")
+    private var finderRect: FloatArray? = null
+    private var finderSw: View? = null
+    private var finderHex: android.widget.EditText? = null
+    private var finderR: android.widget.EditText? = null
+    private var finderG: android.widget.EditText? = null
+    private var finderB: android.widget.EditText? = null
+    private var finderArea: TextView? = null
+    private var finderRes: TextView? = null
+    private var finderUpd = false
 
     private var undoSnap: HashMap<String, Any?>? = null
     private var undoSets: HashMap<String, Any?>? = null   // kayıttan yüklemede limit/scale/ttot geri alımı için
@@ -203,6 +233,11 @@ class StartService : AccessibilityService() {
     private companion object {
         const val SLOTS = SlotStore.SLOTS
         const val IF_BASE = SlotStore.IF_BASE
+        const val NIF_BASE = SlotStore.NIF_BASE
+        const val NIF_HOLD_MS = 700L        // ters if koşulu bu süreden eski görülmüşse basma
+        const val SNAP_HOLD_MS = 450L       // yuva eklerken basılı tutma süresi (yakındaki yuvaya yapıştırır)
+        const val SNAP_DIST_DP = 70         // "yakın" sayılan uzaklık
+        const val AREA_HOLD_MS = 1000L      // Yuva sil düğmesine uzun basış
         const val PLAY = 1
         const val ATTACK = 2
         const val ATTACK_IF = IF_BASE + ATTACK
@@ -218,6 +253,7 @@ class StartService : AccessibilityService() {
             Color.parseColor("#F06292"), Color.parseColor("#A1887F")
         )
         val IF_COLOR = Color.parseColor("#CDDC39")
+        val NIF_COLOR = Color.parseColor("#FF7043")
 
         const val SCAN_PERIOD_MS = 350L
         const val TAP_MS = 30L
@@ -272,6 +308,7 @@ class StartService : AccessibilityService() {
         ServiceBridge.service = this
         resetTotal()
         ensureScan()
+        ui.postDelayed(targetTick, 800)
         note("Servis bağlandı")
     }
 
@@ -302,6 +339,10 @@ class StartService : AccessibilityService() {
         removeView(calibLayer); calibLayer = null
         removeView(panel); panel = null
         removeView(colorsLayer); colorsLayer = null
+        removeView(finderLayer); finderLayer = null
+        removeView(foundLayer); foundLayer = null
+        for (v in targets.values) removeView(v)
+        targets.clear()
         removeView(markers); markers = null
         recognizer?.close(); recognizer = null
         super.onDestroy()
@@ -331,6 +372,7 @@ class StartService : AccessibilityService() {
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE; strokeWidth = dp(3).toFloat()
         }
+        private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textSize = dp(18).toFloat(); textAlign = Paint.Align.CENTER
             typeface = Typeface.DEFAULT_BOLD
@@ -363,9 +405,10 @@ class StartService : AccessibilityService() {
         // if% alanı: mor (henüz ölçülmedi), yeşil (eşik üstü), kırmızı (eşik altı) + son yüzde
         private fun aifFrame(c: Canvas, b: Rect, n: Int, ref: AifRef) {
             val sc = aifLast[n]
+            val th = if (n > NIF_BASE) naifThreshold() else aifThreshold()
             val col = when {
-                sc == null -> Color.parseColor("#B39DDB")
-                sc.total * 100f >= aifThreshold().toFloat() -> Color.parseColor("#00E676")
+                sc == null -> Color.parseColor(if (n > NIF_BASE) "#FFAB91" else "#B39DDB")
+                sc.total * 100f >= th.toFloat() -> Color.parseColor("#00E676")
                 else -> Color.parseColor("#FF5252")
             }
             val pad = dp(5).toFloat()
@@ -376,7 +419,8 @@ class StartService : AccessibilityService() {
             ring.color = col
             txt.color = col
             c.drawRect(l, t, rr, bb, ring)
-            val label = if (sc == null) "if% $n" else "if% $n ${Math.round(sc.total * 100f)}%"
+            val nm = if (n > NIF_BASE) "ters if% ${n - NIF_BASE}" else "if% $n"
+            val label = if (sc == null) nm else "$nm ${Math.round(sc.total * 100f)}%"
             c.drawText(label, (l + rr) / 2f, t - dp(6), txt)
         }
 
@@ -428,16 +472,31 @@ class StartService : AccessibilityService() {
                     if (!slotReady(i)) continue
                     val cx = prefs.getFloat("x$i", 0f) * b.width() - loc[0]
                     val cy = prefs.getFloat("y$i", 0f) * b.height() - loc[1]
-                    val col = if (i > IF_BASE) IF_COLOR else RING_COLORS[i]
+                    val col = when {
+                        i > NIF_BASE -> NIF_COLOR
+                        i > IF_BASE -> IF_COLOR
+                        else -> RING_COLORS[i]
+                    }
                     ring.color = col
                     txt.color = col
                     c.drawCircle(cx, cy, r, ring)
-                    c.drawText(if (i > IF_BASE) "if ${i - IF_BASE}" else i.toString(), cx, cy - r - dp(6), txt)
+                    dot.color = (col and 0xFFFFFF) or (110 shl 24)   // ortadaki yarı saydam nokta = tam tıklama noktası
+                    c.drawCircle(cx, cy, dp(3).toFloat(), dot)
+                    val lbl = when {
+                        i > NIF_BASE -> "ters ${i - NIF_BASE}"
+                        i > IF_BASE -> "if ${i - IF_BASE}"
+                        else -> i.toString()
+                    }
+                    c.drawText(lbl, cx, cy - r - dp(6), txt)
                 }
                 val lab = readLabel
                 frame(c, b, "o", Color.WHITE, if (lab == null) "OKU" else "OKU ($lab)")
                 frame(c, b, "t", Color.parseColor("#FFD600"), "TOPLAM")
                 for (n in 1..8) {
+                    val ref = aifRef(n) ?: continue
+                    aifFrame(c, b, n, ref)
+                }
+                for (n in NIF_BASE + 1..NIF_BASE + 8) {
                     val ref = aifRef(n) ?: continue
                     aifFrame(c, b, n, ref)
                 }
@@ -462,7 +521,7 @@ class StartService : AccessibilityService() {
         wm.addView(v, lp)
     }
 
-    private fun refreshMarkers() { ui.post { markers?.invalidate() } }
+    private fun refreshMarkers() { ui.post { markers?.invalidate(); syncTargets() } }
 
     private fun toggleMarkers() {
         markersOn = !markersOn
@@ -529,182 +588,11 @@ class StartService : AccessibilityService() {
         }
     }
 
-    // --- Panel simgeleri ---
+    // --- Panel simgeleri: Icons.kt ---
 
-    private inner class IconView(ctx: Context, fillColor: Int, inkColor: Int) : View(ctx) {
-        var icon: Ic = Ic.PLUS
-            set(v) { field = v; invalidate() }
-        var fill: Int = fillColor
-            set(v) { field = v; invalidate() }
-        var ink: Int = inkColor
-            set(v) { field = v; invalidate() }
-
-        private val fillP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val edgeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE; color = Color.WHITE
-        }
-        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
-        }
-        private val solid = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
-        }
-
-        private fun head(c: Canvas, x: Float, y: Float, dx: Float, dy: Float, s: Float) {
-            val px = -dy; val py = dx
-            val p = Path().apply {
-                moveTo(x + dx * s, y + dy * s)
-                lineTo(x + px * s * 0.7f, y + py * s * 0.7f)
-                lineTo(x - px * s * 0.7f, y - py * s * 0.7f)
-                close()
-            }
-            c.drawPath(p, solid)
-        }
-
-        private fun diagArrows(c: Canvas, cx: Float, cy: Float, r: Float, outward: Boolean) {
-            val u = 0.7071f
-            for (k in intArrayOf(1, -1)) {
-                val dirx = (if (outward) k else -k) * u
-                val diry = (if (outward) -k else k) * u
-                val far = floatArrayOf(cx + k * r * 0.75f, cy - k * r * 0.75f)
-                val near = floatArrayOf(cx + k * r * 0.2f, cy - k * r * 0.2f)
-                if (outward) {
-                    c.drawLine(near[0], near[1], far[0] - dirx * r * 0.2f, far[1] - diry * r * 0.2f, line)
-                    head(c, far[0] - dirx * r * 0.2f, far[1] - diry * r * 0.2f, dirx, diry, r * 0.4f)
-                } else {
-                    c.drawLine(far[0], far[1], near[0] - dirx * r * 0.05f, near[1] - diry * r * 0.05f, line)
-                    head(c, near[0] - dirx * r * 0.05f, near[1] - diry * r * 0.05f, dirx, diry, r * 0.4f)
-                }
-            }
-        }
-
-        override fun onDraw(c: Canvas) {
-            val cx = width / 2f; val cy = height / 2f
-            val rad = min(width, height) / 2f - dp(1)
-            fillP.color = fill
-            c.drawCircle(cx, cy, rad, fillP)
-            edgeP.strokeWidth = max(1f, dp(2) * scale())
-            c.drawCircle(cx, cy, rad, edgeP)
-            val r = rad * 0.55f
-            val corner = max(1f, dp(2) * scale())
-            line.color = ink; line.strokeWidth = max(2f, rad * 0.13f)
-            solid.color = ink
-            when (icon) {
-                Ic.MOVE -> {
-                    val dirs = arrayOf(floatArrayOf(1f, 0f), floatArrayOf(-1f, 0f),
-                        floatArrayOf(0f, 1f), floatArrayOf(0f, -1f))
-                    for (dd in dirs) {
-                        val ex = cx + dd[0] * r * 0.65f; val ey = cy + dd[1] * r * 0.65f
-                        c.drawLine(cx, cy, ex, ey, line)
-                        head(c, ex, ey, dd[0], dd[1], r * 0.35f)
-                    }
-                }
-                Ic.SHRINK -> diagArrows(c, cx, cy, r, false)
-                Ic.GROW -> diagArrows(c, cx, cy, r, true)
-                Ic.PLAY -> {
-                    val p = Path().apply {
-                        moveTo(cx - r * 0.5f, cy - r * 0.75f)
-                        lineTo(cx - r * 0.5f, cy + r * 0.75f)
-                        lineTo(cx + r * 0.8f, cy)
-                        close()
-                    }
-                    c.drawPath(p, solid)
-                }
-                Ic.STOP -> c.drawRoundRect(
-                    RectF(cx - r * 0.65f, cy - r * 0.65f, cx + r * 0.65f, cy + r * 0.65f),
-                    corner, corner, solid
-                )
-                Ic.PLUS -> {
-                    c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, line)
-                    c.drawLine(cx, cy - r * 0.8f, cx, cy + r * 0.8f, line)
-                }
-                Ic.MINUS -> c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, line)
-                Ic.UNDO -> {
-                    val rr = r * 0.8f
-                    c.drawArc(RectF(cx - rr, cy - rr, cx + rr, cy + rr), 340f, -240f, false, line)
-                    val a = Math.toRadians(100.0)
-                    val ex = cx + rr * cos(a).toFloat(); val ey = cy + rr * sin(a).toFloat()
-                    head(c, ex, ey, sin(a).toFloat(), -cos(a).toFloat(), r * 0.45f)
-                }
-                Ic.EYE_ON, Ic.EYE_OFF -> {
-                    val p = Path().apply {
-                        moveTo(cx - r, cy)
-                        quadTo(cx, cy - r * 1.3f, cx + r, cy)
-                        quadTo(cx, cy + r * 1.3f, cx - r, cy)
-                        close()
-                    }
-                    c.drawPath(p, line)
-                    c.drawCircle(cx, cy, r * 0.32f, solid)
-                    if (icon == Ic.EYE_OFF)
-                        c.drawLine(cx - r, cy + r * 0.9f, cx + r, cy - r * 0.9f, line)
-                }
-                Ic.SCREEN -> {
-                    c.drawRoundRect(
-                        RectF(cx - r, cy - r * 0.75f, cx + r, cy + r * 0.75f),
-                        corner, corner, line
-                    )
-                    textP.color = ink; textP.textSize = r * 1.0f
-                    val fm = textP.fontMetrics
-                    c.drawText("9", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
-                }
-                Ic.HELP -> {
-                    textP.color = ink; textP.textSize = r * 2f
-                    val fm = textP.fontMetrics
-                    c.drawText("?", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
-                }
-                Ic.IF -> {
-                    textP.color = ink; textP.textSize = r * 1.7f
-                    val fm = textP.fontMetrics
-                    c.drawText("if", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
-                }
-                Ic.AIF -> {
-                    textP.color = ink; textP.textSize = r * 1.25f
-                    val fm = textP.fontMetrics
-                    c.drawText("if%", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
-                }
-                Ic.COLORS -> {
-                    val cols = intArrayOf(
-                        Color.parseColor("#FF5252"), Color.parseColor("#FFEB3B"),
-                        Color.parseColor("#40C4FF"), Color.parseColor("#69F0AE")
-                    )
-                    val sx = floatArrayOf(-1f, 1f, -1f, 1f)
-                    val sy = floatArrayOf(-1f, -1f, 1f, 1f)
-                    for (k in 0 until 4) {
-                        solid.color = cols[k]
-                        c.drawCircle(cx + sx[k] * r * 0.5f, cy + sy[k] * r * 0.5f, r * 0.34f, solid)
-                    }
-                }
-                Ic.CROSS -> {
-                    c.drawLine(cx - r * 0.7f, cy - r * 0.7f, cx + r * 0.7f, cy + r * 0.7f, line)
-                    c.drawLine(cx + r * 0.7f, cy - r * 0.7f, cx - r * 0.7f, cy + r * 0.7f, line)
-                }
-                Ic.TROPHY -> {
-                    val p = Path().apply {
-                        moveTo(cx - r * 0.7f, cy - r * 0.8f)
-                        lineTo(cx + r * 0.7f, cy - r * 0.8f)
-                        lineTo(cx + r * 0.45f, cy + r * 0.1f)
-                        quadTo(cx, cy + r * 0.5f, cx - r * 0.45f, cy + r * 0.1f)
-                        close()
-                    }
-                    c.drawPath(p, solid)
-                    c.drawRect(cx - r * 0.1f, cy + r * 0.3f, cx + r * 0.1f, cy + r * 0.65f, solid)
-                    c.drawRect(cx - r * 0.5f, cy + r * 0.65f, cx + r * 0.5f, cy + r * 0.85f, solid)
-                }
-                Ic.SAVE -> {
-                    c.drawRoundRect(
-                        RectF(cx - r * 0.8f, cy - r * 0.8f, cx + r * 0.8f, cy + r * 0.8f),
-                        corner, corner, line
-                    )
-                    c.drawRect(cx - r * 0.45f, cy - r * 0.8f, cx + r * 0.35f, cy - r * 0.2f, solid)
-                    c.drawRect(cx - r * 0.5f, cy + r * 0.15f, cx + r * 0.5f, cy + r * 0.8f, solid)
-                }
-            }
-        }
-    }
 
     private inner class Item(kind: Ic, fillColor: Int, inkColor: Int, sizeDp: Int, label: String) {
-        val iv = IconView(this@StartService, fillColor, inkColor).apply {
+        val iv = IconView(this@StartService, fillColor, inkColor, { dp(it) }, { scale() }).apply {
             icon = kind
             layoutParams = LinearLayout.LayoutParams(d(sizeDp), d(sizeDp)).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
@@ -789,6 +677,10 @@ class StartService : AccessibilityService() {
         val calib = Item(Ic.PLUS, Color.parseColor("#1E88E5"), Color.WHITE, 28, "Yuva 1")
         val ifb = Item(Ic.IF, Color.parseColor("#7E57C2"), Color.WHITE, 28, "if (-)")
         val aifb = Item(Ic.AIF, Color.parseColor("#5E35B1"), Color.WHITE, 28, "if% (-)")
+        val nifb = Item(Ic.IF, Color.parseColor("#EF6C00"), Color.WHITE, 28, "ters if (-)")
+        val naifb = Item(Ic.AIF, Color.parseColor("#BF360C"), Color.WHITE, 28, "ters if% (-)")
+        val delslot = Item(Ic.MINUS, Color.parseColor("#D84315"), Color.WHITE, 28, "Yuva sil")
+        val findb = Item(Ic.SEARCH, Color.parseColor("#00897B"), Color.WHITE, 28, "Renk ara")
         val del = Item(Ic.MINUS, Color.parseColor("#B71C1C"), Color.WHITE, 28, "Hepsini sil")
         val undo = Item(Ic.UNDO, Color.parseColor("#607D8B"), Color.WHITE, 28, "Geri al")
         val hide = Item(Ic.EYE_ON, Color.parseColor("#9E9E9E"), Color.WHITE, 28, "Halkalar")
@@ -806,14 +698,18 @@ class StartService : AccessibilityService() {
         calibItem = calib
         ifItem = ifb
         aifItem = aifb
+        nifItem = nifb
+        naifItem = naifb
         colorsItem = colorsBtn
         hide.iv.icon = if (markersOn) Ic.EYE_ON else Ic.EYE_OFF
         itemMap.clear()
         itemMap["move"] = handle; itemMap["mini"] = mini; itemMap["main"] = main
-        itemMap["calib"] = calib; itemMap["if"] = ifb; itemMap["aif"] = aifb; itemMap["del"] = del
+        itemMap["calib"] = calib; itemMap["if"] = ifb; itemMap["aif"] = aifb
+        itemMap["nif"] = nifb; itemMap["naif"] = naifb; itemMap["delslot"] = delslot; itemMap["del"] = del
         itemMap["undo"] = undo; itemMap["eye"] = hide; itemMap["area"] = area
         itemMap["live"] = live; itemMap["tot"] = tot; itemMap["save"] = save
         itemMap["colors"] = colorsBtn
+        itemMap["find"] = findb
         itemMap["close"] = close
         itemMap["off"] = off
         iconViews.clear()
@@ -879,6 +775,27 @@ class StartService : AccessibilityService() {
         ifb.iv.setOnClickListener { if (!cancelPick()) startIf() }
         aifb.iv.setOnClickListener { if (!cancelPick()) startAif() }
         aifb.iv.setOnLongClickListener { if (!cancelPick()) testAif(); true }
+        nifb.iv.setOnClickListener { if (!cancelPick()) startNif() }
+        naifb.iv.setOnClickListener { if (!cancelPick()) startNaif() }
+        naifb.iv.setOnLongClickListener { if (!cancelPick()) testAif(); true }
+        findb.iv.setOnClickListener { if (!cancelPick()) toggleFinder() }
+        var holdRun: Runnable? = null
+        var holdFired = false
+        delslot.iv.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    holdFired = false
+                    val r = Runnable { holdFired = true; if (!cancelPick()) deleteArea() }
+                    holdRun = r
+                    ui.postDelayed(r, AREA_HOLD_MS)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    holdRun?.let { ui.removeCallbacks(it) }
+                    if (e.actionMasked == MotionEvent.ACTION_UP && !holdFired && !cancelPick()) deleteLastSlot()
+                }
+            }
+            true
+        }
         del.iv.setOnClickListener { if (!cancelPick()) clearSlots() }
         undo.iv.setOnClickListener { if (!cancelPick()) undo() }
         hide.iv.setOnClickListener { if (!cancelPick()) toggleMarkers() }
@@ -919,6 +836,7 @@ class StartService : AccessibilityService() {
     }
 
     private fun closeColors() {
+        ui.removeCallbacks(liveTick)
         removeView(colorsLayer)
         colorsLayer = null
         colorsLp = null
@@ -957,6 +875,34 @@ class StartService : AccessibilityService() {
         colorsLayer = v
         colorsLp = lp
         updateColorsBtn()
+        ui.removeCallbacks(liveTick)
+        ui.postDelayed(liveTick, 300)
+    }
+
+    // Renk listesi açıkken ~0,6 sn'de bir ekran alıp her satırın noktasındaki anlık rengi gösterir
+    private val liveTick = object : Runnable {
+        override fun run() {
+            if (colorsLayer == null) return
+            if (!running && calibLayer == null && finderLayer?.visibility != View.INVISIBLE &&
+                liveRows.isNotEmpty() && !liveColBusy) {
+                liveColBusy = true
+                withScreenshot { bmp ->
+                    liveColBusy = false
+                    if (bmp != null) {
+                        val tol = ctol()
+                        for (r in liveRows) {
+                            val c = sampleColor(bmp, prefs.getFloat("x${r.idx}", 0f), prefs.getFloat("y${r.idx}", 0f))
+                            if (c == null) continue
+                            val ok = close(c, r.ref, if (r.idx == PLAY) tol + 13 else tol)
+                            (r.sw.background as? GradientDrawable)?.setColor(c or (0xFF shl 24))
+                            r.tv.text = String.format(java.util.Locale.US, "#%06X", c and 0xFFFFFF)
+                            r.tv.setTextColor(if (ok) Color.parseColor("#69F0AE") else Color.parseColor("#FF8A80"))
+                        }
+                    }
+                }
+            }
+            ui.postDelayed(this, 600)
+        }
     }
 
     // Panelin sağına koyar, sığmazsa soluna
@@ -978,6 +924,7 @@ class StartService : AccessibilityService() {
     }
 
     private fun buildColorsView(): View {
+        liveRows.clear()
         val sc = scale()
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1026,7 +973,8 @@ class StartService : AccessibilityService() {
                 ok -> prefs.getInt("c$i", 0) or (0xFF shl 24)
                 else -> null
             }
-            val has = ok || ifOk || aref != null
+            val nifOk = slotReady(NIF_BASE + i) || aifReady(NIF_BASE + i)
+            val has = ok || ifOk || aref != null || nifOk
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -1080,6 +1028,37 @@ class StartService : AccessibilityService() {
                     layoutParams = LinearLayout.LayoutParams(d(64), LinearLayout.LayoutParams.WRAP_CONTENT)
                 })
             }
+            // Kayıtlı rengin sağında: o noktada ekranda ŞU AN görünen renk (yarım saniyede bir güncellenir)
+            val liveIdx = when { ifOk -> IF_BASE + i; ok -> i; else -> null }
+            if (liveIdx != null) {
+                val sw = View(this).apply {
+                    background = GradientDrawable().apply {
+                        setColor(Color.TRANSPARENT)
+                        cornerRadius = d(5).toFloat()
+                        setStroke(dp(1), Color.WHITE)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(d(24), d(24)).apply {
+                        marginStart = d(4); marginEnd = d(6)
+                    }
+                }
+                val tv = TextView(this).apply {
+                    text = "canlı…"
+                    textSize = 12f * sc
+                    typeface = Typeface.MONOSPACE
+                    setTextColor(Color.parseColor("#9FB0C7"))
+                    maxLines = 1
+                    layoutParams = LinearLayout.LayoutParams(d(64), LinearLayout.LayoutParams.WRAP_CONTENT)
+                }
+                row.addView(sw); row.addView(tv)
+                liveRows.add(LiveRow(liveIdx, sw, tv, prefs.getInt("c$liveIdx", 0)))
+            }
+            if (nifOk) row.addView(TextView(this).apply {
+                text = "ters"
+                textSize = 11f * sc
+                setTextColor(NIF_COLOR)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(d(4), 0, 0, 0)
+            })
             row.addView(miniBtn(if (has) "Değiştir" else "Ekle", "#1E88E5", sc) { changeSlot(i) })
             if (has) row.addView(miniBtn("Sil", "#B71C1C", sc) { deleteSlot(i) })
             box.addView(row)
@@ -1129,15 +1108,208 @@ class StartService : AccessibilityService() {
         if (running) { toast("Döngü açıkken silinmez. Önce durdur."); return }
         saveUndo()
         val ib = IF_BASE + i
+        val nb = NIF_BASE + i
         prefs.edit()
             .remove("x$i").remove("y$i").remove("c$i")
             .remove("x$ib").remove("y$ib").remove("c$ib")
-            .remove("aif_$i")
+            .remove("x$nb").remove("y$nb").remove("c$nb")
+            .remove("aif_$i").remove("naif_$i")
             .commit()
         refreshMarkers()
         updateLabels()
         val nx = nextSlotNum()
         toast("Yuva $i silindi" + (if (nx != null) ", sıradaki: $nx (${SlotStore.NAMES[nx]})" else "") + ". Geri al ile kurtarabilirsin.")
+    }
+
+    // Yuva sil: 8, 7, 6 ... 1 sırasıyla, dolu olan en yüksek yuvayı (bağlı if, if%, ters if, ters if% ile) siler
+    private fun deleteLastSlot() {
+        val i = (8 downTo 1).firstOrNull {
+            slotReady(it) || slotReady(IF_BASE + it) || aifReady(it) ||
+                slotReady(NIF_BASE + it) || aifReady(NIF_BASE + it)
+        }
+        if (i == null) {
+            toast("Silinecek yuva yok. 1 sn basılı tutarsan okuma alanları silinir")
+            return
+        }
+        deleteSlot(i)
+    }
+
+    // Yuva sil düğmesine 1 sn basış: önce Toplam kupa alanı, o yoksa karakter kupası okuma alanı
+    private fun deleteArea() {
+        if (running) { toast("Döngü açıkken silinmez. Önce durdur."); return }
+        val keep = HashMap<String, Any?>()
+        keep["limit"] = sets.getInt("limit", SlotStore.DEFAULT_LIMIT)
+        keep["scale"] = sets.getFloat("scale", 1f)
+        keep["ttot"] = sets.getBoolean("ttot", false)
+        if (SlotStore.totReady(prefs)) {
+            saveUndo(); undoSets = keep
+            prefs.edit().remove("tx1").remove("ty1").remove("tx2").remove("ty2").commit()
+            sets.edit().putBoolean("ttot", false).apply()
+            resetTotal()
+            toast("Toplam kupa alanı silindi. 1 sn daha basılı tutarsan karakter kupası okuma alanı silinir")
+        } else if (SlotStore.rectReady(prefs)) {
+            saveUndo(); undoSets = keep
+            prefs.edit().remove("ox1").remove("oy1").remove("ox2").remove("oy2").commit()
+            toast("Karakter kupası okuma alanı silindi")
+        } else {
+            toast("Silinecek alan yok")
+        }
+        refreshMarkers()
+        updateLabels()
+    }
+
+    // --- Yuva halkalarına 3 kez dokunarak taşıma (sadece insan dokunuşu, döngü kapalıyken) ---
+
+    private val targetTick = object : Runnable {
+        override fun run() {
+            syncTargets()
+            ui.postDelayed(this, 600)
+        }
+    }
+
+    // Döngü kapalı ve seçim yokken her kayıtlı yuvanın üstüne küçük dokunma penceresi koyar.
+    // Döngü çalışırken pencereler kaldırılır, bu yüzden bot dokunuşları buraya hiç ulaşmaz.
+    private fun syncTargets() {
+        if (!::wm.isInitialized) return
+        val want = !running && calibLayer == null && markersOn && panelShown && finderLayer == null
+        val keep = if (want) (1..SLOTS).filter { slotReady(it) } else emptyList()
+        val b = screenBounds()
+        val sig = keep.joinToString(",") {
+            "$it:${prefs.getFloat("x$it", 0f)}:${prefs.getFloat("y$it", 0f)}"
+        } + "|${b.width()}x${b.height()}"
+        if (sig == targetSig) return
+        targetSig = sig
+        for (v in targets.values) removeView(v)
+        targets.clear()
+        for (i in keep) addTarget(i, b)
+        if (keep.isNotEmpty()) raisePanel()
+    }
+
+    private fun addTarget(i: Int, b: Rect) {
+        val sz = dp(40)
+        val v = View(this)
+        val down = FloatArray(2)
+        v.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { down[0] = e.rawX; down[1] = e.rawY }
+                MotionEvent.ACTION_UP ->
+                    if (abs(e.rawX - down[0]) < dp(12) && abs(e.rawY - down[1]) < dp(12)) onTargetTap(i)
+            }
+            true
+        }
+        val lp = WindowManager.LayoutParams(
+            sz, sz,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (prefs.getFloat("x$i", 0f) * b.width()).toInt() - sz / 2
+            y = (prefs.getFloat("y$i", 0f) * b.height()).toInt() - sz / 2
+        }
+        try { wm.addView(v, lp); targets[i] = v } catch (_: Exception) {}
+    }
+
+    private fun onTargetTap(i: Int) {
+        val now = System.currentTimeMillis()
+        if (running || now - lastTapMs[i] < 300) return
+        val l = tapTimes.getOrPut(i) { ArrayList() }
+        l.add(now)
+        while (l.size > 3) l.removeAt(0)
+        if (l.size == 3 && now - l[0] <= 500L) {
+            l.clear()
+            startMove(i)
+        }
+    }
+
+    private inner class MoveView(ctx: Context, private val col: Int, private val lp: WindowManager.LayoutParams,
+                                 private val w: Int, private val onOk: () -> Unit) : View(ctx) {
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val hx = w * 0.4f
+        private val okx = w * 0.8f
+        private val rh = dp(22).toFloat()
+        private val ro = dp(15).toFloat()
+        private var mode = 0
+        private var dx0 = 0f; private var dy0 = 0f; private var sx = 0; private var sy = 0
+
+        override fun onDraw(c: Canvas) {
+            p.style = Paint.Style.FILL; p.color = (col and 0xFFFFFF) or (0x55 shl 24)
+            c.drawCircle(hx, hx, rh, p)
+            p.style = Paint.Style.STROKE; p.strokeWidth = dp(3).toFloat(); p.color = col
+            c.drawCircle(hx, hx, rh, p)
+            p.style = Paint.Style.FILL; p.color = Color.WHITE
+            c.drawCircle(hx, hx, dp(3).toFloat(), p)
+            p.color = Color.parseColor("#2E7D32")
+            c.drawCircle(okx, okx, ro, p)
+            p.style = Paint.Style.STROKE; p.color = Color.WHITE; p.strokeWidth = dp(3).toFloat()
+            p.strokeCap = Paint.Cap.ROUND
+            val k = ro * 0.5f
+            c.drawLine(okx - k, okx, okx - k * 0.25f, okx + k * 0.7f, p)
+            c.drawLine(okx - k * 0.25f, okx + k * 0.7f, okx + k, okx - k * 0.6f, p)
+        }
+
+        override fun onTouchEvent(e: MotionEvent): Boolean {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    val ok = Math.hypot((e.x - okx).toDouble(), (e.y - okx).toDouble()) <= ro * 1.4
+                    val h = Math.hypot((e.x - hx).toDouble(), (e.y - hx).toDouble()) <= rh * 1.5
+                    mode = if (ok) 2 else if (h) 1 else 0
+                    dx0 = e.rawX; dy0 = e.rawY; sx = lp.x; sy = lp.y
+                }
+                MotionEvent.ACTION_MOVE -> if (mode == 1) {
+                    val b = screenBounds()
+                    lp.x = (sx + (e.rawX - dx0).toInt()).coerceIn((-hx).toInt(), b.width() - hx.toInt())
+                    lp.y = (sy + (e.rawY - dy0).toInt()).coerceIn((-hx).toInt(), b.height() - hx.toInt())
+                    try { wm.updateViewLayout(this, lp) } catch (_: Exception) {}
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (mode == 2 && Math.hypot((e.x - okx).toDouble(), (e.y - okx).toDouble()) <= ro * 1.6) onOk()
+                    mode = 0
+                }
+                MotionEvent.ACTION_CANCEL -> mode = 0
+            }
+            return true
+        }
+    }
+
+    // Yuvayı taşır: daireyi sürükle, sağ alttaki ✓ ile kabul et. İptal: panelde bir butona bas.
+    private fun startMove(slot: Int) {
+        if (calibLayer != null || running) return
+        closeColors()
+        val b = screenBounds()
+        val w = dp(96)
+        val col = when {
+            slot > NIF_BASE -> NIF_COLOR
+            slot > IF_BASE -> IF_COLOR
+            else -> RING_COLORS[slot]
+        }
+        val lp = WindowManager.LayoutParams(
+            w, w,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (prefs.getFloat("x$slot", 0f) * b.width() - w * 0.4f).toInt()
+            y = (prefs.getFloat("y$slot", 0f) * b.height() - w * 0.4f).toInt()
+        }
+        var holder: View? = null
+        val v = MoveView(this, col, lp, w) {
+            val bb = screenBounds()
+            val fx = ((lp.x + w * 0.4f) / bb.width()).coerceIn(0f, 1f)
+            val fy = ((lp.y + w * 0.4f) / bb.height()).coerceIn(0f, 1f)
+            removeView(holder); calibLayer = null
+            saveSlotPoint(slot, fx, fy, "Yuva $slot taşındı")
+        }
+        holder = v
+        try { wm.addView(v, lp) } catch (_: Exception) { toast("Taşıma açılamadı"); return }
+        calibLayer = v
+        toast("Yuva $slot: daireyi sürükle, sağ alttaki ✓ ile kabul et. İptal: panelde bir butona bas")
+        raisePanel()
     }
 
     // Satırda gösterilen öğeyi ekrandan yeniden seçtirir: if% alanı, yoksa if noktası, yoksa yuva noktası
@@ -1149,6 +1321,11 @@ class StartService : AccessibilityService() {
             slotReady(IF_BASE + i) ->
                 pickPoint("if ($i): bu renk görününce yuva $i basılır. Yeni noktaya dokun. İptal: panelde bir butona bas") { fx, fy ->
                     saveSlotPoint(IF_BASE + i, fx, fy, "if ($i) değiştirildi")
+                }
+            aifReady(NIF_BASE + i) -> selectAif(NIF_BASE + i)
+            slotReady(NIF_BASE + i) ->
+                pickPoint("ters if ($i): bu renk GÖRÜNMEYİNCE yuva $i basılır. Yeni noktaya dokun. İptal: panelde bir butona bas") { fx, fy ->
+                    saveSlotPoint(NIF_BASE + i, fx, fy, "ters if ($i) değiştirildi")
                 }
             else ->
                 pickPoint("Yuva $i (${SlotStore.NAMES[i]}): yeni noktaya dokun. İptal: panelde bir butona bas") { fx, fy ->
@@ -1181,6 +1358,8 @@ class StartService : AccessibilityService() {
             val last = (1..8).lastOrNull { slotReady(it) }
             ifItem?.tv?.text = if (last == null) "if (-)" else "if ($last)"
             aifItem?.tv?.text = if (last == null) "if% (-)" else "if% ($last)"
+            nifItem?.tv?.text = if (last == null) "ters if (-)" else "ters if ($last)"
+            naifItem?.tv?.text = if (last == null) "ters if% (-)" else "ters if% ($last)"
         }
     }
 
@@ -1382,11 +1561,25 @@ class StartService : AccessibilityService() {
         closeColors()
         toast(prompt)
         val layer = View(this).apply { setBackgroundColor(Color.parseColor("#33000000")) }
+        val downAt = LongArray(1)
         layer.setOnTouchListener { _, e ->
             if (e.action == MotionEvent.ACTION_DOWN) {
+                downAt[0] = System.currentTimeMillis()
+            } else if (e.action == MotionEvent.ACTION_UP) {
                 val b = screenBounds()
-                val fx = (e.rawX / b.width()).coerceIn(0f, 1f)
-                val fy = (e.rawY / b.height()).coerceIn(0f, 1f)
+                var fx = (e.rawX / b.width()).coerceIn(0f, 1f)
+                var fy = (e.rawY / b.height()).coerceIn(0f, 1f)
+                val held = System.currentTimeMillis() - downAt[0] >= SNAP_HOLD_MS
+                if (held) {
+                    // Basılı tutuş: yakındaki yuvanın tam noktasına yapıştır; yakında yuva yoksa hiçbir şey yapma
+                    val near = nearestSlot(e.rawX, e.rawY, b)
+                    if (near == null) {
+                        toast("Yakında yuva yok, bir şey yapılmadı. Normal koymak için kısa dokun")
+                        return@setOnTouchListener true
+                    }
+                    fx = prefs.getFloat("x$near", fx)
+                    fy = prefs.getFloat("y$near", fy)
+                }
                 removeView(layer); calibLayer = null
                 onPoint(fx, fy)
             }
@@ -1404,6 +1597,19 @@ class StartService : AccessibilityService() {
         calibLayer = layer
         wm.addView(layer, lp)
         raisePanel()
+    }
+
+    private fun nearestSlot(px: Float, py: Float, b: Rect): Int? {
+        var best: Int? = null
+        var bd = dp(SNAP_DIST_DP).toFloat()
+        for (i in 1..SLOTS) {
+            if (!slotReady(i)) continue
+            val dx = prefs.getFloat("x$i", 0f) * b.width() - px
+            val dy = prefs.getFloat("y$i", 0f) * b.height() - py
+            val dist = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+            if (dist <= bd) { bd = dist; best = i }
+        }
+        return best
     }
 
     // Noktanın rengini alıp slot numarasına kaydeder (slot 1-8 veya IF_BASE+n)
@@ -1450,7 +1656,7 @@ class StartService : AccessibilityService() {
 
     // Kayıt çözülmüş haliyle önbellekte tutulur; metin değişince yeniden çözülür.
     private fun aifRef(n: Int): AifRef? {
-        val raw = prefs.getString("aif_$n", null) ?: return null
+        val raw = prefs.getString(aifKey(n), null) ?: return null
         val c = aifCache[n]
         if (c != null && c.first == raw) return c.second
         val r = SlotStore.aifDecode(raw)
@@ -1459,6 +1665,10 @@ class StartService : AccessibilityService() {
     }
 
     private fun aifReady(n: Int) = aifRef(n) != null
+
+    // n = 1..8: if%; n = 21..28: ters if%
+    private fun aifKey(n: Int) = if (n > NIF_BASE) "naif_${n - NIF_BASE}" else "aif_$n"
+    private fun aifLabel(n: Int) = if (n > NIF_BASE) "ters if% (${n - NIF_BASE})" else "if% ($n)"
 
     // Kesirli alan -> piksel dikdörtgeni (en az 4x4 piksel)
     private fun pxRect(bmp: Bitmap, fx1: Float, fy1: Float, fx2: Float, fy2: Float): Rect? {
@@ -1500,10 +1710,35 @@ class StartService : AccessibilityService() {
     private fun aifMatch(n: Int, bmp: Bitmap): Boolean {
         val s = aifScore(n, bmp) ?: return false
         aifLast[n] = s
-        return s.total * 100f >= aifThreshold().toFloat()
+        val th = if (n > NIF_BASE) naifThreshold() else aifThreshold()
+        return s.total * 100f >= th.toFloat()
     }
 
     // if%: en son kaydedilen yuvaya bağlanır (if ile aynı kural), alanı iki köşeyle seçersin
+    // ters if: o renk GÖRÜNMEDİĞİNDE yuva basılır
+    private fun startNif() {
+        val last = (1..8).lastOrNull { slotReady(it) }
+        if (last == null) { toast("Önce yuva kaydet, ilk kayıt ters if olamaz"); return }
+        if (last == CHARACTER || last == SELECT) {
+            toast("7 ve 8 renge bakmaz, bunlara ters if konmaz"); return
+        }
+        if (slotReady(NIF_BASE + last)) { toast("ters if ($last) zaten var"); return }
+        pickPoint("ters if ($last): bu renk GÖRÜNMEYİNCE yuva $last basılır. Noktaya dokun. İptal: panelde bir butona bas") { fx, fy ->
+            saveSlotPoint(NIF_BASE + last, fx, fy, "ters if ($last) kaydedildi")
+        }
+    }
+
+    // ters if%: seçilen alana UYMUYORSA yuva basılır
+    private fun startNaif() {
+        val last = (1..8).lastOrNull { slotReady(it) }
+        if (last == null) { toast("Önce yuva kaydet, ilk kayıt ters if% olamaz"); return }
+        if (last == CHARACTER || last == SELECT) {
+            toast("7 ve 8 görüntüye bakmaz, bunlara ters if% konmaz"); return
+        }
+        if (aifReady(NIF_BASE + last)) { toast("ters if% ($last) zaten var"); return }
+        selectAif(NIF_BASE + last)
+    }
+
     private fun startAif() {
         val last = (1..8).lastOrNull { slotReady(it) }
         if (last == null) { toast("Önce yuva kaydet, ilk kayıt if% olamaz"); return }
@@ -1518,10 +1753,10 @@ class StartService : AccessibilityService() {
         if (calibLayer != null) return
         val t = ++rectToken
         rectPending = true
-        pickPoint("if% ($slot): bakılacak alanın SOL ÜST köşesine dokun. İptal: panelde bir butona bas") { x1, y1 ->
+        pickPoint("${aifLabel(slot)}: bakılacak alanın SOL ÜST köşesine dokun. İptal: panelde bir butona bas") { x1, y1 ->
             ui.postDelayed({
                 if (t != rectToken) return@postDelayed
-                pickPoint("if% ($slot): şimdi SAĞ ALT köşeye dokun. İptal: panelde bir butona bas") { x2, y2 ->
+                pickPoint("${aifLabel(slot)}: şimdi SAĞ ALT köşeye dokun. İptal: panelde bir butona bas") { x2, y2 ->
                     rectPending = false
                     val l = min(x1, x2); val r = max(x1, x2)
                     val tp = min(y1, y2); val bt = max(y1, y2)
@@ -1548,10 +1783,10 @@ class StartService : AccessibilityService() {
                     toast("Alan alınamadı, kaydedilmedi. Tekrar dene.")
                 } else {
                     saveUndo()
-                    prefs.edit().putString("aif_$slot", SlotStore.aifEncode(ref)).commit()
+                    prefs.edit().putString(aifKey(slot), SlotStore.aifEncode(ref)).commit()
                     refreshMarkers()
                     updateLabels()
-                    toast("if% ($slot) kaydedildi (${ref.gw}x${ref.gh} hücre). Uyumu görmek için if% düğmesine basılı tut.")
+                    toast("${aifLabel(slot)} kaydedildi (${ref.gw}x${ref.gh} hücre). Uyumu görmek için if% düğmesine basılı tut.")
                 }
                 maybeReopenColors()
             }
@@ -1560,25 +1795,28 @@ class StartService : AccessibilityService() {
 
     // if% düğmesine uzun basış: kayıtlı tüm if% alanlarının şu anki uyumunu gösterir
     private fun testAif() {
-        val ns = (1..8).filter { aifReady(it) }
+        val ns = (1..8).filter { aifReady(it) } + (NIF_BASE + 1..NIF_BASE + 8).filter { aifReady(it) }
         if (ns.isEmpty()) { toast("Kayıtlı if% yok"); return }
         withScreenshotWait { bmp ->
             if (bmp == null) {
                 toast("Ekran alınamadı")
             } else {
-                val th = aifThreshold()
-                val sb = StringBuilder("if% (eşik %$th)")
+                val sb = StringBuilder("if% (eşik %${aifThreshold()}, ters if% eşiği %${naifThreshold()})")
                 for (n in ns) {
                     val s = aifScore(n, bmp)
+                    val th = if (n > NIF_BASE) naifThreshold() else aifThreshold()
+                    val nm = if (n > NIF_BASE) "ters ${n - NIF_BASE}" else "$n"
                     if (s == null) {
-                        sb.append("\n$n: hesaplanamadı")
+                        sb.append("\n$nm: hesaplanamadı")
                     } else {
                         aifLast[n] = s
                         val pc = Math.round(s.total * 100f)
                         val pcc = Math.round(s.color * 100f)
                         val pce = Math.round(s.edge * 100f)
-                        sb.append("\n$n: %$pc (renk %$pcc, şekil %$pce) ")
-                        sb.append(if (s.total * 100f >= th.toFloat()) "uyuyor" else "uymuyor")
+                        sb.append("\n$nm: %$pc (renk %$pcc, şekil %$pce) ")
+                        val fits = s.total * 100f >= th.toFloat()
+                        sb.append(if (fits) "uyuyor" else "uymuyor")
+                        if (n > NIF_BASE) sb.append(if (fits) " (basmaz)" else " (basar)")
                     }
                 }
                 toast(sb.toString())
@@ -1886,11 +2124,13 @@ class StartService : AccessibilityService() {
         override fun run() {
             if (!running) { combatRunning = false; return }
             val now = System.currentTimeMillis()
-            val period = attackPeriodMs()
+            val nifOn = slotReady(NIF_BASE + ATTACK) || aifReady(NIF_BASE + ATTACK)
+            val period = if (nifOn) nifPeriodMs() else attackPeriodMs()
             val gated = slotReady(ATTACK_IF) || aifReady(ATTACK)
             val ok = if (gated) now - lastAttackSeenMs < IF_HOLD_MS
             else now - lastGateMs < GATE_FRESH_MS
-            if (inMatch && ok && phase == Phase.LOOP && slotReady(ATTACK)) {
+            val nifOk = !nifOn || now - lastNifOkMs < NIF_HOLD_MS
+            if (inMatch && ok && nifOk && phase == Phase.LOOP && slotReady(ATTACK)) {
                 tapSlot(ATTACK)
             }
             if (nextTapAt == 0L || now - nextTapAt > period * 3) nextTapAt = now
@@ -1900,24 +2140,31 @@ class StartService : AccessibilityService() {
         }
     }
 
-    private fun hit(i: Int, bmp: Bitmap, tol: Int = COLOR_TOLERANCE): Boolean {
+    // tol < 0: uygulamadaki renk payı (ctol); yuva 1 için +13
+    private fun hit(i: Int, bmp: Bitmap, tol: Int = -1): Boolean {
         if (!slotReady(i)) return false
         val c = sampleColor(bmp, prefs.getFloat("x$i", 0f), prefs.getFloat("y$i", 0f)) ?: return false
-        val t = if (i == PLAY && tol == COLOR_TOLERANCE) PLAY_TOLERANCE else tol
+        val t = if (tol >= 0) tol else if (i == PLAY) ctol() + 13 else ctol()
         return close(c, prefs.getInt("c$i", 0), t)
     }
+
+    // Ters if / ters if% koşulu yuvayı engelliyor mu: o renk (ya da şekil) görünüyorsa true
+    private fun nifBlocked(i: Int, bmp: Bitmap): Boolean =
+        (slotReady(NIF_BASE + i) && hit(NIF_BASE + i, bmp)) ||
+            (aifReady(NIF_BASE + i) && aifMatch(NIF_BASE + i, bmp))
 
     // Yuvanın rengi görünüyor ve (varsa) if rengi ile if% uyumu da tamam
     private fun menuHit(i: Int, bmp: Bitmap) =
         hit(i, bmp) &&
             (!slotReady(IF_BASE + i) || hit(IF_BASE + i, bmp)) &&
-            (!aifReady(i) || aifMatch(i, bmp))
+            (!aifReady(i) || aifMatch(i, bmp)) &&
+            !nifBlocked(i, bmp)
 
     private fun attackMatch(bmp: Bitmap): Boolean {
         if (!slotReady(ATTACK)) return false
         val c = sampleColor(bmp, prefs.getFloat("x$ATTACK", 0f), prefs.getFloat("y$ATTACK", 0f)) ?: return false
         val ref = prefs.getInt("c$ATTACK", 0)
-        if (close(c, ref, COLOR_TOLERANCE)) return true
+        if (close(c, ref, ctol())) return true
         val hc = FloatArray(3); val hr = FloatArray(3)
         Color.colorToHSV(c, hc); Color.colorToHSV(ref, hr)
         if (hr[1] < 0.2f) return hc[1] < 0.3f && abs(hc[2] - hr[2]) < 0.3f
@@ -1972,6 +2219,8 @@ class StartService : AccessibilityService() {
             else -> attackMatch(bmp)
         }
         if (aifLast.isNotEmpty()) refreshMarkers()
+        val nifOn = slotReady(NIF_BASE + ATTACK) || aifReady(NIF_BASE + ATTACK)
+        if (!nifOn || !nifBlocked(ATTACK, bmp)) lastNifOkMs = now
         if (sig) { hitStreak++; missStreak = 0; lastAttackSeenMs = now }
         else { hitStreak = 0; missStreak++ }
 
@@ -2194,39 +2443,30 @@ class StartService : AccessibilityService() {
             stopAll("Kupa $v (≥$lim) ama yuva 6-8 eksik: sistem durdu")
             return
         }
+        // Yuva 6 renge bakmaz: 5 sn sonra 6, 5 sn sonra 7, 5 sn sonra 8'e basılır
         phase = Phase.SWITCH
-        switchArmed = false
-        stepStartMs = System.currentTimeMillis()
-        note("Karakter değiştiriliyor")
-    }
-
-    private fun switchLive(s: Int, tok: Int) =
-        running && s == session && tok == switchToken && phase == Phase.SWITCH
-
-    private fun switchStep(bmp: Bitmap, now: Long) {
-        if (switchArmed) return
-        if (now - stepStartMs > STEP_TIMEOUT_MS) {
-            stopAll("Savaşçılar düğmesi görünmedi: sistem durdu")
-            return
-        }
-        streak[BRAWLERS] = if (menuHit(BRAWLERS, bmp)) streak[BRAWLERS] + 1 else 0
-        if (streak[BRAWLERS] < CONFIRM_SCANS) return
-        streak[BRAWLERS] = 0
-        tapSlot(BRAWLERS)
         switchArmed = true
+        stepStartMs = System.currentTimeMillis()
         val s = session
         val tok = ++switchToken
-        ui.postDelayed({
-            if (switchLive(s, tok)) tapSlot(CHARACTER)
-        }, STEP_DELAY_MS)
+        note("Karakter değiştiriliyor: ${STEP_DELAY_MS / 1000} sn sonra 6, sonra 7, sonra 8")
+        ui.postDelayed({ if (switchLive(s, tok)) tapSlot(BRAWLERS) }, STEP_DELAY_MS)
+        ui.postDelayed({ if (switchLive(s, tok)) tapSlot(CHARACTER) }, STEP_DELAY_MS * 2)
         ui.postDelayed({
             if (switchLive(s, tok)) {
                 tapSlot(SELECT)
                 afterSwitch = true
                 startReading(System.currentTimeMillis() + SETTLE_MS)
             }
-        }, STEP_DELAY_MS * 2)
+        }, STEP_DELAY_MS * 3)
     }
+
+    private fun switchLive(s: Int, tok: Int) =
+        running && s == session && tok == switchToken && phase == Phase.SWITCH
+
+    // Zamanlama decide() içinde: 6 renge bakılmaz, sadece süreyle basılır
+    @Suppress("UNUSED_PARAMETER")
+    private fun switchStep(bmp: Bitmap, now: Long) {}
 
     private fun cropForOcr(bmp: Bitmap, variant: Int): Bitmap? = cropRect(bmp, "o", variant)
 
@@ -2468,7 +2708,592 @@ class StartService : AccessibilityService() {
         }
     }
 
+    // --- Renk ara: alanda sadece RENK arar (yuva kaydetmez), bulunan yerlerin kutusunu çizer ---
+
+    private fun toggleFinder() {
+        if (finderLayer != null) { closeFinder(); return }
+        if (running) { toast("Döngü açıkken renk arama açılmaz. Önce durdur."); return }
+        closeColors()
+        openFinder()
+    }
+
+    private fun closeFinder() {
+        removeView(foundLayer); foundLayer = null
+        removeView(finderLayer); finderLayer = null
+        finderLp = null
+        targetSig = ""
+        syncTargets()
+    }
+
+    private fun hex6(c: Int) = String.format(java.util.Locale.US, "#%06X", c and 0xFFFFFF)
+
+    // Rengi tüm kutulara (örnek, hex, R, G, B) yazar
+    private fun setFinderColor(c: Int) {
+        finderColor = c or (0xFF shl 24)
+        finderUpd = true
+        (finderSw?.background as? GradientDrawable)?.setColor(finderColor)
+        finderHex?.setText(hex6(c))
+        finderR?.setText(Color.red(c).toString())
+        finderG?.setText(Color.green(c).toString())
+        finderB?.setText(Color.blue(c).toString())
+        finderUpd = false
+    }
+
+    private fun areaText(): String {
+        val a = finderRect ?: return "Alan: tüm ekran"
+        return String.format(java.util.Locale.US, "Alan: x %.0f-%.0f%%, y %.0f-%.0f%%",
+            a[0] * 100, a[2] * 100, a[1] * 100, a[3] * 100)
+    }
+
+    private fun finderEdit(sc: Float, w: Int, numeric: Boolean, max: Int) = android.widget.EditText(this).apply {
+        textSize = 13f * sc
+        setTextColor(Color.WHITE)
+        setHintTextColor(Color.parseColor("#889AAA"))
+        typeface = Typeface.MONOSPACE
+        inputType = if (numeric) android.text.InputType.TYPE_CLASS_NUMBER
+        else android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        filters = arrayOf(android.text.InputFilter.LengthFilter(max))
+        setSingleLine(true)
+        background = GradientDrawable().apply {
+            setColor(Color.parseColor("#33FFFFFF")); cornerRadius = d(6).toFloat()
+        }
+        setPadding(d(6), d(4), d(6), d(4))
+        layoutParams = LinearLayout.LayoutParams(d(w), LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = d(6) }
+    }
+
+    private fun openFinder() {
+        val sc = scale()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#F0101820")); cornerRadius = d(10).toFloat()
+                setStroke(dp(1), Color.parseColor("#66FFFFFF"))
+            }
+            setPadding(d(10), d(8), d(10), d(10))
+        }
+        fun label(t: String) = TextView(this).apply {
+            text = t; textSize = 12f * sc; setTextColor(Color.WHITE)
+        }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        head.addView(TextView(this).apply {
+            text = "Renk ara"; textSize = 13f * sc; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = d(16) }
+        })
+        head.addView(miniBtn("Kapat", "#B71C1C", sc) { closeFinder() })
+        box.addView(head)
+
+        box.addView(label("Spektrum (soldan sağa ton, yukarı beyaz, aşağı siyah):").apply { setPadding(0, d(6), 0, d(3)) })
+        box.addView(SpectrumView(this) { c -> setFinderColor(c) }.apply {
+            layoutParams = LinearLayout.LayoutParams(d(240), d(120))
+        })
+
+        val sw = View(this).apply {
+            background = GradientDrawable().apply {
+                setColor(finderColor); cornerRadius = d(6).toFloat(); setStroke(dp(1), Color.WHITE)
+            }
+            layoutParams = LinearLayout.LayoutParams(d(34), d(34)).apply { marginEnd = d(8) }
+        }
+        finderSw = sw
+        val hex = finderEdit(sc, 96, false, 7).apply { hint = "#RRGGBB" }
+        val r = finderEdit(sc, 48, true, 3).apply { hint = "R" }
+        val g = finderEdit(sc, 48, true, 3).apply { hint = "G" }
+        val bl = finderEdit(sc, 48, true, 3).apply { hint = "B" }
+        finderHex = hex; finderR = r; finderG = g; finderB = bl
+
+        fun fromRgb() {
+            if (finderUpd) return
+            val rr = r.text.toString().toIntOrNull(); val gg = g.text.toString().toIntOrNull()
+            val bb = bl.text.toString().toIntOrNull()
+            if (rr == null || gg == null || bb == null) return
+            val c = Color.rgb(rr.coerceIn(0, 255), gg.coerceIn(0, 255), bb.coerceIn(0, 255))
+            finderColor = c
+            finderUpd = true
+            (sw.background as? GradientDrawable)?.setColor(c)
+            hex.setText(hex6(c))
+            finderUpd = false
+        }
+        for (e in listOf(r, g, bl)) e.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            override fun afterTextChanged(a: android.text.Editable?) { fromRgb() }
+        })
+        hex.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            override fun afterTextChanged(a: android.text.Editable?) {
+                if (finderUpd) return
+                val t = a.toString().trim().removePrefix("#")
+                if (t.length != 6) return
+                val v = t.toIntOrNull(16) ?: return
+                val c = (0xFF shl 24) or v
+                finderColor = c
+                finderUpd = true
+                (sw.background as? GradientDrawable)?.setColor(c)
+                r.setText(Color.red(c).toString()); g.setText(Color.green(c).toString())
+                bl.setText(Color.blue(c).toString())
+                finderUpd = false
+            }
+        })
+        val row1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, d(8), 0, 0)
+        }
+        row1.addView(sw); row1.addView(hex)
+        box.addView(row1)
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, d(6), 0, 0)
+        }
+        row2.addView(label("R ")); row2.addView(r); row2.addView(label("G ")); row2.addView(g)
+        row2.addView(label("B ")); row2.addView(bl)
+        box.addView(row2)
+        box.addView(label("Her kanal 0-255").apply { textSize = 10f * sc; setTextColor(Color.parseColor("#9FB0C7")) })
+
+        val row3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, d(8), 0, 0) }
+        row3.addView(miniBtn("Ekrandan seç", "#1E88E5", sc) { finderPickScreen() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).marginStart = 0
+        })
+        row3.addView(miniBtn("Alan seç", "#00ACC1", sc) { finderPickArea() })
+        row3.addView(miniBtn("Tüm ekran", "#607D8B", sc) { finderRect = null; finderArea?.text = areaText() })
+        box.addView(row3)
+        val ar = label(areaText()).apply { setPadding(0, d(6), 0, 0) }
+        finderArea = ar
+        box.addView(ar)
+
+        val row4 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, d(8), 0, 0) }
+        row4.addView(miniBtn("ARA", "#2E7D32", sc) { runFinder() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).marginStart = 0
+        })
+        box.addView(row4)
+        val res = label("Renk payı ±${ctol()} (uygulamadan değişir). Sonuç burada görünür.").apply {
+            setPadding(0, d(6), 0, 0)
+            setTextColor(Color.parseColor("#FFD54F"))
+        }
+        finderRes = res
+        box.addView(res)
+
+        // Klavye için pencere odaklanabilir; dışarıdaki dokunuşlar alttaki pencerelere (panel) geçer
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+        }
+        placeColors(box, lp)
+        try { wm.addView(box, lp) } catch (_: Exception) { toast("Renk arama açılamadı"); return }
+        finderLayer = box
+        finderLp = lp
+        setFinderColor(finderColor)
+        syncTargets()
+    }
+
+    private fun finderPickScreen() {
+        pickPoint("Rengini almak istediğin yere dokun. İptal: panelde bir butona bas") { fx, fy ->
+            ui.postDelayed({
+                withScreenshotWait { bmp ->
+                    val c = bmp?.let { sampleColor(it, fx, fy) }
+                    if (c != null) setFinderColor(c) else toast("Renk alınamadı, tekrar dene")
+                }
+            }, 300)
+        }
+    }
+
+    private fun finderPickArea() {
+        if (calibLayer != null) return
+        val t = ++rectToken
+        rectPending = true
+        pickPoint("Arama alanı: SOL ÜST köşeye dokun. İptal: panelde bir butona bas") { x1, y1 ->
+            ui.postDelayed({
+                if (t != rectToken) return@postDelayed
+                pickPoint("Arama alanı: şimdi SAĞ ALT köşeye dokun. İptal: panelde bir butona bas") { x2, y2 ->
+                    rectPending = false
+                    val l = min(x1, x2); val r = max(x1, x2)
+                    val tp = min(y1, y2); val bt = max(y1, y2)
+                    if (r - l < 0.01f || bt - tp < 0.01f) {
+                        toast("Alan çok küçük, tekrar dene")
+                    } else {
+                        finderRect = floatArrayOf(l, tp, r, bt)
+                        finderArea?.text = areaText()
+                    }
+                }
+            }, 300)
+        }
+    }
+
+    // Arama anında bizim pencereler görüntüye girmesin diye geçici gizlenir
+    private fun runFinder() {
+        val fl = finderLayer ?: return
+        val c = finderColor
+        val tol = ctol()
+        val area = finderRect
+        removeView(foundLayer); foundLayer = null
+        finderRes?.text = "Aranıyor…"
+        val pm = panel?.visibility; val mm = markers?.visibility
+        fl.visibility = View.INVISIBLE
+        panel?.visibility = View.INVISIBLE
+        markers?.visibility = View.INVISIBLE
+        ui.postDelayed({
+            withScreenshotWait { bmp ->
+                val res = bmp?.let { ColorSearch.find(it, c, tol, area) }
+                fl.visibility = View.VISIBLE
+                if (pm != null) panel?.visibility = pm
+                if (mm != null) markers?.visibility = mm
+                if (res == null) {
+                    finderRes?.text = "Ekran alınamadı, tekrar dene"
+                } else if (res.boxes.isEmpty()) {
+                    finderRes?.text = "yok: bu renk bu alanda bulunamadı (pay ±$tol). Payı uygulamadan artırabilirsin."
+                } else {
+                    finderRes?.text = "${res.boxes.size} yer bulundu (${res.pixels} piksel), kutularla işaretli (8 sn)"
+                    showFound(res.boxes, area)
+                }
+            }
+        }, 350)
+    }
+
+    private inner class FoundView(ctx: Context, private val boxes: List<RectF>, private val area: FloatArray?) : View(ctx) {
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        private val loc = IntArray(2)
+        override fun onDraw(c: Canvas) {
+            getLocationOnScreen(loc)
+            val b = screenBounds()
+            if (area != null) {
+                p.color = Color.WHITE; p.strokeWidth = dp(1).toFloat()
+                c.drawRect(area[0] * b.width() - loc[0], area[1] * b.height() - loc[1],
+                    area[2] * b.width() - loc[0], area[3] * b.height() - loc[1], p)
+            }
+            for (r in boxes) {
+                val l = r.left * b.width() - loc[0]; val t = r.top * b.height() - loc[1]
+                val rr = r.right * b.width() - loc[0]; val bb = r.bottom * b.height() - loc[1]
+                p.color = Color.BLACK; p.strokeWidth = dp(5).toFloat()
+                c.drawRect(l, t, rr, bb, p)
+                p.color = Color.parseColor("#FF00E5"); p.strokeWidth = dp(3).toFloat()
+                c.drawRect(l, t, rr, bb, p)
+            }
+        }
+    }
+
+    private fun showFound(boxes: List<RectF>, area: FloatArray?) {
+        val v = FoundView(this, boxes, area)
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        try { wm.addView(v, lp) } catch (_: Exception) { return }
+        foundLayer = v
+        raisePanel()
+        ui.postDelayed({ if (foundLayer === v) { removeView(v); foundLayer = null } }, 8000)
+    }
+
     private fun toast(s: String) {
         ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+    }
+}
+// ---- simgeler (eski Icons.kt) ----
+
+internal enum class Ic { MOVE, PLAY, STOP, PLUS, MINUS, UNDO, EYE_ON, EYE_OFF, SCREEN, HELP, CROSS, TROPHY, SAVE, SHRINK, GROW, IF, COLORS, AIF, SEARCH }
+
+// Panel simgeleri. dp ve ölçek servisten gelir.
+internal class IconView(
+    ctx: Context, fillColor: Int, inkColor: Int,
+    private val dpFn: (Int) -> Int, private val scaleFn: () -> Float
+) : View(ctx) {
+    private fun dp(v: Int) = dpFn(v)
+    private fun scale() = scaleFn()
+
+    var icon: Ic = Ic.PLUS
+        set(v) { field = v; invalidate() }
+    var fill: Int = fillColor
+        set(v) { field = v; invalidate() }
+    var ink: Int = inkColor
+        set(v) { field = v; invalidate() }
+
+    private val fillP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val edgeP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.WHITE
+    }
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+    }
+    private val solid = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
+    }
+
+    private fun head(c: Canvas, x: Float, y: Float, dx: Float, dy: Float, s: Float) {
+        val px = -dy; val py = dx
+        val p = Path().apply {
+            moveTo(x + dx * s, y + dy * s)
+            lineTo(x + px * s * 0.7f, y + py * s * 0.7f)
+            lineTo(x - px * s * 0.7f, y - py * s * 0.7f)
+            close()
+        }
+        c.drawPath(p, solid)
+    }
+
+    private fun diagArrows(c: Canvas, cx: Float, cy: Float, r: Float, outward: Boolean) {
+        val u = 0.7071f
+        for (k in intArrayOf(1, -1)) {
+            val dirx = (if (outward) k else -k) * u
+            val diry = (if (outward) -k else k) * u
+            val far = floatArrayOf(cx + k * r * 0.75f, cy - k * r * 0.75f)
+            val near = floatArrayOf(cx + k * r * 0.2f, cy - k * r * 0.2f)
+            if (outward) {
+                c.drawLine(near[0], near[1], far[0] - dirx * r * 0.2f, far[1] - diry * r * 0.2f, line)
+                head(c, far[0] - dirx * r * 0.2f, far[1] - diry * r * 0.2f, dirx, diry, r * 0.4f)
+            } else {
+                c.drawLine(far[0], far[1], near[0] - dirx * r * 0.05f, near[1] - diry * r * 0.05f, line)
+                head(c, near[0] - dirx * r * 0.05f, near[1] - diry * r * 0.05f, dirx, diry, r * 0.4f)
+            }
+        }
+    }
+
+    override fun onDraw(c: Canvas) {
+        val cx = width / 2f; val cy = height / 2f
+        val rad = min(width, height) / 2f - dp(1)
+        fillP.color = fill
+        c.drawCircle(cx, cy, rad, fillP)
+        edgeP.strokeWidth = max(1f, dp(2) * scale())
+        c.drawCircle(cx, cy, rad, edgeP)
+        val r = rad * 0.55f
+        val corner = max(1f, dp(2) * scale())
+        line.color = ink; line.strokeWidth = max(2f, rad * 0.13f)
+        solid.color = ink
+        when (icon) {
+            Ic.MOVE -> {
+                val dirs = arrayOf(floatArrayOf(1f, 0f), floatArrayOf(-1f, 0f),
+                    floatArrayOf(0f, 1f), floatArrayOf(0f, -1f))
+                for (dd in dirs) {
+                    val ex = cx + dd[0] * r * 0.65f; val ey = cy + dd[1] * r * 0.65f
+                    c.drawLine(cx, cy, ex, ey, line)
+                    head(c, ex, ey, dd[0], dd[1], r * 0.35f)
+                }
+            }
+            Ic.SHRINK -> diagArrows(c, cx, cy, r, false)
+            Ic.GROW -> diagArrows(c, cx, cy, r, true)
+            Ic.PLAY -> {
+                val p = Path().apply {
+                    moveTo(cx - r * 0.5f, cy - r * 0.75f)
+                    lineTo(cx - r * 0.5f, cy + r * 0.75f)
+                    lineTo(cx + r * 0.8f, cy)
+                    close()
+                }
+                c.drawPath(p, solid)
+            }
+            Ic.STOP -> c.drawRoundRect(
+                RectF(cx - r * 0.65f, cy - r * 0.65f, cx + r * 0.65f, cy + r * 0.65f),
+                corner, corner, solid
+            )
+            Ic.PLUS -> {
+                c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, line)
+                c.drawLine(cx, cy - r * 0.8f, cx, cy + r * 0.8f, line)
+            }
+            Ic.MINUS -> c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, line)
+            Ic.UNDO -> {
+                val rr = r * 0.8f
+                c.drawArc(RectF(cx - rr, cy - rr, cx + rr, cy + rr), 340f, -240f, false, line)
+                val a = Math.toRadians(100.0)
+                val ex = cx + rr * cos(a).toFloat(); val ey = cy + rr * sin(a).toFloat()
+                head(c, ex, ey, sin(a).toFloat(), -cos(a).toFloat(), r * 0.45f)
+            }
+            Ic.EYE_ON, Ic.EYE_OFF -> {
+                val p = Path().apply {
+                    moveTo(cx - r, cy)
+                    quadTo(cx, cy - r * 1.3f, cx + r, cy)
+                    quadTo(cx, cy + r * 1.3f, cx - r, cy)
+                    close()
+                }
+                c.drawPath(p, line)
+                c.drawCircle(cx, cy, r * 0.32f, solid)
+                if (icon == Ic.EYE_OFF)
+                    c.drawLine(cx - r, cy + r * 0.9f, cx + r, cy - r * 0.9f, line)
+            }
+            Ic.SCREEN -> {
+                c.drawRoundRect(
+                    RectF(cx - r, cy - r * 0.75f, cx + r, cy + r * 0.75f),
+                    corner, corner, line
+                )
+                textP.color = ink; textP.textSize = r * 1.0f
+                val fm = textP.fontMetrics
+                c.drawText("9", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+            }
+            Ic.HELP -> {
+                textP.color = ink; textP.textSize = r * 2f
+                val fm = textP.fontMetrics
+                c.drawText("?", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+            }
+            Ic.IF -> {
+                textP.color = ink; textP.textSize = r * 1.7f
+                val fm = textP.fontMetrics
+                c.drawText("if", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+            }
+            Ic.AIF -> {
+                textP.color = ink; textP.textSize = r * 1.25f
+                val fm = textP.fontMetrics
+                c.drawText("if%", cx, cy - (fm.ascent + fm.descent) / 2f, textP)
+            }
+            Ic.COLORS -> {
+                val cols = intArrayOf(
+                    Color.parseColor("#FF5252"), Color.parseColor("#FFEB3B"),
+                    Color.parseColor("#40C4FF"), Color.parseColor("#69F0AE")
+                )
+                val sx = floatArrayOf(-1f, 1f, -1f, 1f)
+                val sy = floatArrayOf(-1f, -1f, 1f, 1f)
+                for (k in 0 until 4) {
+                    solid.color = cols[k]
+                    c.drawCircle(cx + sx[k] * r * 0.5f, cy + sy[k] * r * 0.5f, r * 0.34f, solid)
+                }
+            }
+            Ic.SEARCH -> {
+                c.drawCircle(cx - r * 0.2f, cy - r * 0.2f, r * 0.5f, line)
+                c.drawLine(cx + r * 0.17f, cy + r * 0.17f, cx + r * 0.75f, cy + r * 0.75f, line)
+            }
+            Ic.CROSS -> {
+                c.drawLine(cx - r * 0.7f, cy - r * 0.7f, cx + r * 0.7f, cy + r * 0.7f, line)
+                c.drawLine(cx + r * 0.7f, cy - r * 0.7f, cx - r * 0.7f, cy + r * 0.7f, line)
+            }
+            Ic.TROPHY -> {
+                val p = Path().apply {
+                    moveTo(cx - r * 0.7f, cy - r * 0.8f)
+                    lineTo(cx + r * 0.7f, cy - r * 0.8f)
+                    lineTo(cx + r * 0.45f, cy + r * 0.1f)
+                    quadTo(cx, cy + r * 0.5f, cx - r * 0.45f, cy + r * 0.1f)
+                    close()
+                }
+                c.drawPath(p, solid)
+                c.drawRect(cx - r * 0.1f, cy + r * 0.3f, cx + r * 0.1f, cy + r * 0.65f, solid)
+                c.drawRect(cx - r * 0.5f, cy + r * 0.65f, cx + r * 0.5f, cy + r * 0.85f, solid)
+            }
+            Ic.SAVE -> {
+                c.drawRoundRect(
+                    RectF(cx - r * 0.8f, cy - r * 0.8f, cx + r * 0.8f, cy + r * 0.8f),
+                    corner, corner, line
+                )
+                c.drawRect(cx - r * 0.45f, cy - r * 0.8f, cx + r * 0.35f, cy - r * 0.2f, solid)
+                c.drawRect(cx - r * 0.5f, cy + r * 0.15f, cx + r * 0.5f, cy + r * 0.8f, solid)
+            }
+        }
+    }
+}
+
+// Spektrum karesi: soldan sağa ton, üst yarı beyazdan saf renge, alt yarı saf renkten siyaha
+internal class SpectrumView(ctx: Context, private val onPick: (Int) -> Unit) : View(ctx) {
+    private var bmp: Bitmap? = null
+    private var mx = -1f
+    private var my = -1f
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+        if (w <= 0 || h <= 0) return
+        val px = IntArray(w * h)
+        val hsv = FloatArray(3)
+        for (y in 0 until h) {
+            val t = y / (h - 1f).coerceAtLeast(1f)
+            for (x in 0 until w) {
+                hsv[0] = x / (w - 1f).coerceAtLeast(1f) * 359.9f
+                if (t < 0.5f) { hsv[1] = t * 2f; hsv[2] = 1f } else { hsv[1] = 1f; hsv[2] = 1f - (t - 0.5f) * 2f }
+                px[y * w + x] = Color.HSVToColor(hsv)
+            }
+        }
+        bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    override fun onDraw(c: Canvas) {
+        val b = bmp ?: return
+        c.drawBitmap(b, 0f, 0f, null)
+        if (mx >= 0f) {
+            p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = Color.BLACK
+            c.drawCircle(mx, my, 14f, p)
+            p.strokeWidth = 2f; p.color = Color.WHITE
+            c.drawCircle(mx, my, 14f, p)
+        }
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        val b = bmp ?: return true
+        if (e.actionMasked == MotionEvent.ACTION_DOWN || e.actionMasked == MotionEvent.ACTION_MOVE) {
+            mx = e.x.coerceIn(0f, b.width - 1f)
+            my = e.y.coerceIn(0f, b.height - 1f)
+            onPick(b.getPixel(mx.toInt(), my.toInt()))
+            invalidate()
+        }
+        return true
+    }
+}
+
+// Saf arama mantığı: ekran görüntüsünde hedef renge (kanal başına ±tol) uyan pikselleri bulur,
+// yakın olanları kutulara toplar. Kutular ekranın kesirleri (0-1) olarak döner.
+internal object ColorSearch {
+    class Result(val boxes: List<RectF>, val pixels: Int)
+
+    private const val CELL = 12
+    private const val MIN_CELL_PIXELS = 3
+    private const val MAX_BOXES = 60
+
+    fun find(bmp: Bitmap, target: Int, tol: Int, area: FloatArray?): Result {
+        val w = bmp.width; val h = bmp.height
+        val x0 = ((area?.get(0) ?: 0f) * w).toInt().coerceIn(0, w - 1)
+        val y0 = ((area?.get(1) ?: 0f) * h).toInt().coerceIn(0, h - 1)
+        val x1 = ((area?.get(2) ?: 1f) * w).toInt().coerceIn(x0 + 1, w)
+        val y1 = ((area?.get(3) ?: 1f) * h).toInt().coerceIn(y0 + 1, h)
+        val aw = x1 - x0; val ah = y1 - y0
+        val px = IntArray(aw * ah)
+        bmp.getPixels(px, 0, aw, x0, y0, aw, ah)
+        return findIn(px, aw, ah, target, tol, x0, y0, w, h)
+    }
+
+    fun findIn(px: IntArray, aw: Int, ah: Int, target: Int, tol: Int, ox: Int, oy: Int, fw: Int, fh: Int): Result {
+        val gw = (aw + CELL - 1) / CELL
+        val gh = (ah + CELL - 1) / CELL
+        val cnt = IntArray(gw * gh)
+        val tr = Color.red(target); val tg = Color.green(target); val tb = Color.blue(target)
+        var total = 0
+        for (y in 0 until ah) {
+            val row = y * aw
+            val gy = (y / CELL) * gw
+            for (x in 0 until aw) {
+                val p = px[row + x]
+                if (Math.abs(Color.red(p) - tr) <= tol && Math.abs(Color.green(p) - tg) <= tol &&
+                    Math.abs(Color.blue(p) - tb) <= tol) {
+                    cnt[gy + x / CELL]++
+                    total++
+                }
+            }
+        }
+        val seen = BooleanArray(gw * gh)
+        val out = ArrayList<Pair<Int, RectF>>()
+        val stack = IntArray(gw * gh)
+        for (start in cnt.indices) {
+            if (seen[start] || cnt[start] < MIN_CELL_PIXELS) continue
+            var sp = 0
+            stack[sp++] = start; seen[start] = true
+            var minC = Int.MAX_VALUE; var maxC = -1; var minR = Int.MAX_VALUE; var maxR = -1
+            var cells = 0
+            while (sp > 0) {
+                val cur = stack[--sp]
+                val cx = cur % gw; val cy = cur / gw
+                cells++
+                if (cx < minC) minC = cx; if (cx > maxC) maxC = cx
+                if (cy < minR) minR = cy; if (cy > maxR) maxR = cy
+                for (dy in -1..1) for (dx in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val nx = cx + dx; val ny = cy + dy
+                    if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue
+                    val ni = ny * gw + nx
+                    if (!seen[ni] && cnt[ni] >= MIN_CELL_PIXELS) { seen[ni] = true; stack[sp++] = ni }
+                }
+            }
+            val l = (ox + minC * CELL).toFloat() / fw
+            val t = (oy + minR * CELL).toFloat() / fh
+            val r = (ox + minOf((maxC + 1) * CELL, aw)).toFloat() / fw
+            val b = (oy + minOf((maxR + 1) * CELL, ah)).toFloat() / fh
+            out.add(cells to RectF(l, t, r, b))
+        }
+        out.sortByDescending { it.first }
+        return Result(out.take(MAX_BOXES).map { it.second }, total)
     }
 }
