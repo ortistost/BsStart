@@ -25,6 +25,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -83,7 +84,7 @@ class StartService : AccessibilityService() {
             }
         }
 
-    // Saldırı (yuva 2) basış hızı: saniyede kaç kez, ayarlardan gelir (0.3-10, varsayılan 3)
+    // Saldırı (yuva 2) basış hızı: saniyede kaç kez, ayarlardan gelir (0.1-10, varsayılan 3)
     private fun attackRate() = sets.getFloat("atkrate", SlotStore.DEFAULT_ATK_RATE)
         .coerceIn(SlotStore.MIN_ATK_RATE, SlotStore.MAX_ATK_RATE)
     private fun attackPeriodMs(): Long = max(1L, (1000f / attackRate()).toLong())
@@ -145,6 +146,8 @@ class StartService : AccessibilityService() {
     private var liveStartMs = 0L
 
     private var undoSnap: HashMap<String, Any?>? = null
+    private var undoSets: HashMap<String, Any?>? = null   // kayıttan yüklemede limit/scale/ttot geri alımı için
+    private var reopenColors = false                       // Değiştir bitince renk listesini tekrar aç
 
     private var running = false
     private var scanRunning = false
@@ -262,8 +265,10 @@ class StartService : AccessibilityService() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         sets.registerOnSharedPreferenceChangeListener(setListener)
+        panelShown = !sets.getBoolean("panelclosed", false)
         showMarkers()
         showPanel(d(8), d(24))
+        if (!panelShown) markers?.visibility = View.INVISIBLE
         ServiceBridge.service = this
         resetTotal()
         ensureScan()
@@ -791,6 +796,7 @@ class StartService : AccessibilityService() {
         val live = Item(Ic.HELP, Color.parseColor("#FDD835"), Color.BLACK, 28, "Test oku")
         val tot = Item(Ic.TROPHY, Color.parseColor("#795548"), Color.WHITE, 28, "Toplam")
         val save = Item(Ic.SAVE, Color.parseColor("#2E7D32"), Color.WHITE, 28, "Kaydet")
+        val close = Item(Ic.CROSS, Color.parseColor("#B71C1C"), Color.WHITE, 28, "Kapat")
         val off = Item(Ic.CROSS, Color.BLACK, Color.parseColor("#FF1744"), 28, "Gizle")
         val colorsBtn = Item(Ic.COLORS, Color.parseColor("#37474F"), Color.WHITE, 28, "Renkler")
         mainItem = main
@@ -808,6 +814,7 @@ class StartService : AccessibilityService() {
         itemMap["undo"] = undo; itemMap["eye"] = hide; itemMap["area"] = area
         itemMap["live"] = live; itemMap["tot"] = tot; itemMap["save"] = save
         itemMap["colors"] = colorsBtn
+        itemMap["close"] = close
         itemMap["off"] = off
         iconViews.clear()
         iconViews.addAll(itemMap.values.map { it.iv })
@@ -881,6 +888,7 @@ class StartService : AccessibilityService() {
         tot.iv.setOnClickListener { if (!cancelPick()) onTotalTap() }
         tot.iv.setOnLongClickListener { if (!cancelPick()) selectRect("t"); true }
         save.iv.setOnClickListener { if (!cancelPick()) saveRecord() }
+        close.iv.setOnClickListener { if (!cancelPick()) closePanel() }
         off.iv.setOnClickListener { if (!cancelPick()) hidePanel() }
         colorsBtn.iv.setOnClickListener { if (!cancelPick()) toggleColors() }
 
@@ -1009,8 +1017,16 @@ class StartService : AccessibilityService() {
         box.addView(head)
 
         for (i in 1..8) {
+            val aref = aifRef(i)
+            val ifOk = slotReady(IF_BASE + i)
             val ok = slotReady(i)
-            val c = if (ok) prefs.getInt("c$i", 0) or (0xFF shl 24) else Color.TRANSPARENT
+            // Satırda geçerli olan gösterilir: if% alanı, yoksa if rengi, yoksa yuva rengi
+            val shown: Int? = when {
+                ifOk -> prefs.getInt("c${IF_BASE + i}", 0) or (0xFF shl 24)
+                ok -> prefs.getInt("c$i", 0) or (0xFF shl 24)
+                else -> null
+            }
+            val has = ok || ifOk || aref != null
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -1030,26 +1046,115 @@ class StartService : AccessibilityService() {
                 maxLines = 1
                 layoutParams = LinearLayout.LayoutParams(d(84), LinearLayout.LayoutParams.WRAP_CONTENT)
             })
-            row.addView(View(this).apply {
-                background = GradientDrawable().apply {
-                    setColor(c)
-                    cornerRadius = d(5).toFloat()
-                    setStroke(dp(1), if (ok) Color.WHITE else Color.parseColor("#88FFFFFF"))
-                }
-                layoutParams = LinearLayout.LayoutParams(d(24), d(24)).apply {
-                    marginStart = d(8); marginEnd = d(8)
-                }
-            })
-            row.addView(TextView(this).apply {
-                text = if (ok) String.format(java.util.Locale.US, "#%06X", c and 0xFFFFFF) else "kayıtlı değil"
-                textSize = 12f * sc
-                typeface = Typeface.MONOSPACE
-                setTextColor(if (ok) Color.WHITE else Color.parseColor("#9FB0C7"))
-                maxLines = 1
-            })
+            if (aref != null) {
+                row.addView(aifThumb(aref))
+                row.addView(TextView(this).apply {
+                    text = if (ifOk) "if% + if" else "if%"
+                    textSize = 12f * sc
+                    typeface = Typeface.MONOSPACE
+                    setTextColor(Color.WHITE)
+                    maxLines = 1
+                    layoutParams = LinearLayout.LayoutParams(d(64), LinearLayout.LayoutParams.WRAP_CONTENT)
+                })
+            } else {
+                row.addView(View(this).apply {
+                    background = GradientDrawable().apply {
+                        setColor(shown ?: Color.TRANSPARENT)
+                        cornerRadius = d(5).toFloat()
+                        setStroke(dp(1), if (shown != null) Color.WHITE else Color.parseColor("#88FFFFFF"))
+                    }
+                    layoutParams = LinearLayout.LayoutParams(d(24), d(24)).apply {
+                        marginStart = d(8); marginEnd = d(8)
+                    }
+                })
+                row.addView(TextView(this).apply {
+                    text = when {
+                        shown == null -> "kayıtlı değil"
+                        ifOk -> String.format(java.util.Locale.US, "if #%06X", (shown ?: 0) and 0xFFFFFF)
+                        else -> String.format(java.util.Locale.US, "#%06X", (shown ?: 0) and 0xFFFFFF)
+                    }
+                    textSize = 12f * sc
+                    typeface = Typeface.MONOSPACE
+                    setTextColor(if (shown != null) Color.WHITE else Color.parseColor("#9FB0C7"))
+                    maxLines = 1
+                    layoutParams = LinearLayout.LayoutParams(d(64), LinearLayout.LayoutParams.WRAP_CONTENT)
+                })
+            }
+            row.addView(miniBtn(if (has) "Değiştir" else "Ekle", "#1E88E5", sc) { changeSlot(i) })
+            if (has) row.addView(miniBtn("Sil", "#B71C1C", sc) { deleteSlot(i) })
             box.addView(row)
         }
         return box
+    }
+
+    private fun miniBtn(label: String, colorHex: String, sc: Float, act: () -> Unit) = TextView(this).apply {
+        text = label
+        textSize = 11f * sc
+        setTextColor(Color.WHITE)
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        background = GradientDrawable().apply {
+            setColor(Color.parseColor(colorHex))
+            cornerRadius = d(7).toFloat()
+        }
+        setPadding(d(8), d(4), d(8), d(4))
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { marginStart = d(6) }
+        setOnClickListener { act() }
+    }
+
+    // if% için kaydedilen alanın küçültülmüş görüntüsü (hücre başına bir piksel, keskin büyütülür)
+    private fun aifThumb(ref: AifRef): View {
+        val bmp = Bitmap.createBitmap(ref.gw, ref.gh, Bitmap.Config.ARGB_8888)
+        val px = IntArray(ref.gw * ref.gh) { ref.rgb[it] or (0xFF shl 24) }
+        bmp.setPixels(px, 0, ref.gw, 0, 0, ref.gw, ref.gh)
+        val hh = d(26)
+        val ww = (hh * ref.gw / ref.gh.toFloat()).toInt().coerceIn(d(16), d(80))
+        return ImageView(this).apply {
+            setImageDrawable(android.graphics.drawable.BitmapDrawable(resources, bmp).apply { isFilterBitmap = false })
+            scaleType = ImageView.ScaleType.FIT_XY
+            layoutParams = LinearLayout.LayoutParams(ww, hh).apply { marginStart = d(8); marginEnd = d(8) }
+        }
+    }
+
+    private fun maybeReopenColors() {
+        if (!reopenColors) return
+        reopenColors = false
+        ui.postDelayed({ if (!running && colorsLayer == null && calibLayer == null) openColors() }, 500)
+    }
+
+    // Satırı siler: yuva, bağlı if ve if% hepsi gider. Sonraki "Yuva kaydet" bu numaradan devam eder.
+    private fun deleteSlot(i: Int) {
+        if (running) { toast("Döngü açıkken silinmez. Önce durdur."); return }
+        saveUndo()
+        val ib = IF_BASE + i
+        prefs.edit()
+            .remove("x$i").remove("y$i").remove("c$i")
+            .remove("x$ib").remove("y$ib").remove("c$ib")
+            .remove("aif_$i")
+            .commit()
+        refreshMarkers()
+        updateLabels()
+        val nx = nextSlotNum()
+        toast("Yuva $i silindi" + (if (nx != null) ", sıradaki: $nx (${SlotStore.NAMES[nx]})" else "") + ". Geri al ile kurtarabilirsin.")
+    }
+
+    // Satırda gösterilen öğeyi ekrandan yeniden seçtirir: if% alanı, yoksa if noktası, yoksa yuva noktası
+    private fun changeSlot(i: Int) {
+        if (running) { toast("Döngü açıkken değişmez. Önce durdur."); return }
+        reopenColors = true
+        when {
+            aifReady(i) -> selectAif(i)
+            slotReady(IF_BASE + i) ->
+                pickPoint("if ($i): bu renk görününce yuva $i basılır. Yeni noktaya dokun. İptal: panelde bir butona bas") { fx, fy ->
+                    saveSlotPoint(IF_BASE + i, fx, fy, "if ($i) değiştirildi")
+                }
+            else ->
+                pickPoint("Yuva $i (${SlotStore.NAMES[i]}): yeni noktaya dokun. İptal: panelde bir butona bas") { fx, fy ->
+                    saveSlotPoint(i, fx, fy, "Yuva $i değiştirildi")
+                }
+        }
     }
 
     private fun toggleMinimize() {
@@ -1120,6 +1225,7 @@ class StartService : AccessibilityService() {
         if (calibLayer == null && !rectPending) return false
         rectToken++
         rectPending = false
+        reopenColors = false
         removeView(calibLayer); calibLayer = null
         toast("Seçim iptal edildi")
         return true
@@ -1131,6 +1237,7 @@ class StartService : AccessibilityService() {
         panel?.visibility = if (v) View.VISIBLE else View.GONE
         markers?.visibility = if (v) View.VISIBLE else View.INVISIBLE
         if (v) {
+            sets.edit().putBoolean("panelclosed", false).apply()
             resetTotal()
             ensureScan()
         }
@@ -1150,10 +1257,22 @@ class StartService : AccessibilityService() {
         toast("Panel gizlendi. Geri açmak için uygulamadaki düğme.")
     }
 
+    // Kapat: gizler ve bir sonraki açılışta da gizli kalır. Uygulamadaki "Paneli göster / gizle" geri getirir.
+    private fun closePanel() {
+        setPanelVisible(false)
+        sets.edit().putBoolean("panelclosed", true).apply()
+        toast("Panel kapatıldı. Geri açmak için uygulamadaki düğme.")
+    }
+
+    // Uygulama bir kaydı yüklemeden hemen önce çağırır: Geri al yuvaları ve SET ayarlarını geri getirsin
+    fun prepareExternalLoad() {
+        saveUndo()
+        undoSets = HashMap<String, Any?>(sets.all)
+    }
+
     fun onExternalLoad() {
         ui.post {
             haltLoop()
-            undoSnap = null
             resetTotal()
             refreshMarkers()
             updateLabels()
@@ -1192,6 +1311,7 @@ class StartService : AccessibilityService() {
 
     private fun saveUndo() {
         undoSnap = HashMap<String, Any?>(prefs.all)
+        undoSets = null
     }
 
     private fun undo() {
@@ -1210,7 +1330,21 @@ class StartService : AccessibilityService() {
             }
         }
         e.commit()
+        val us = undoSets
+        if (us != null) {
+            val se = sets.edit()
+            for (k in listOf("limit", "scale", "ttot")) {
+                when (val v = us[k]) {
+                    is Int -> se.putInt(k, v)
+                    is Float -> se.putFloat(k, v)
+                    is Boolean -> se.putBoolean(k, v)
+                    else -> se.remove(k)
+                }
+            }
+            se.commit()
+        }
         undoSnap = null
+        undoSets = null
         refreshMarkers()
         updateLabels()
         toast("Son değişiklik geri alındı")
@@ -1288,6 +1422,7 @@ class StartService : AccessibilityService() {
                 } else {
                     toast("Renk alınamadı, kaydedilmedi. Tekrar dene.")
                 }
+                maybeReopenColors()
             }
         }, 300)
     }
@@ -1361,7 +1496,7 @@ class StartService : AccessibilityService() {
         } catch (_: Exception) { null }
     }
 
-    // Toplam uyum yüzdesi eşiğin (varsayılan %90) üstündeyse true
+    // Toplam uyum yüzdesi eşiğin (varsayılan %80) üstündeyse true
     private fun aifMatch(n: Int, bmp: Bitmap): Boolean {
         val s = aifScore(n, bmp) ?: return false
         aifLast[n] = s
@@ -1392,6 +1527,7 @@ class StartService : AccessibilityService() {
                     val tp = min(y1, y2); val bt = max(y1, y2)
                     if (r - l < 0.01f || bt - tp < 0.01f) {
                         toast("Alan çok küçük, tekrar dene")
+                        maybeReopenColors()
                     } else {
                         saveAif(slot, l, tp, r, bt)
                     }
@@ -1417,6 +1553,7 @@ class StartService : AccessibilityService() {
                     updateLabels()
                     toast("if% ($slot) kaydedildi (${ref.gw}x${ref.gh} hücre). Uyumu görmek için if% düğmesine basılı tut.")
                 }
+                maybeReopenColors()
             }
         }, 300)
     }
@@ -2278,60 +2415,4 @@ class StartService : AccessibilityService() {
                         } finally {
                             result.hardwareBuffer.close()
                             shotBusy = false
-                        }
-                        try { done(bmp) } finally { bmp?.recycle() }
-                    }
-
-                    override fun onFailure(errorCode: Int) {
-                        shotBusy = false
-                        done(null)
-                    }
-                })
-        } catch (e: Exception) {
-            shotBusy = false
-            logRead("ekran görüntüsü hatası: ${e.javaClass.simpleName} ${e.message?.take(60) ?: ""}")
-            done(null)
-        }
-    }
-
-    // Tarama zaten ~0,35 sn'de bir ekran görüntüsü alıyor; Android iki görüntü arasında en az bir süre
-    // bekletir (bildiğim kadarıyla yaklaşık 0,33 sn). Test düğmeleri ayrı görüntü istemek yerine taramanın
-    // bir sonraki karesini bekler; tarama yoksa ya da kare gelmezse eski yöntemle kendi görüntüsünü alır.
-    private fun withScreenshotWait(tries: Int = 15, done: (Bitmap?) -> Unit) {
-        if (!scanRunning) { shotRetry(tries, done); return }
-        val w = FrameWaiter(done)
-        frameWaiters.add(w)
-        ui.postDelayed({
-            if (frameWaiters.remove(w)) shotRetry(tries, done)
-        }, FRAME_WAIT_MS)
-    }
-
-    // Meşgul veya sistem aralık hatası verirse bekleyip tekrar dener (en fazla ~2,3 sn)
-    private fun shotRetry(tries: Int, done: (Bitmap?) -> Unit) {
-        withScreenshot { bmp ->
-            if (bmp == null && tries > 0) {
-                ui.postDelayed({ shotRetry(tries - 1, done) }, 150)
-            } else {
-                done(bmp)
-            }
-        }
-    }
-
-    // Tarama karesini bekleyen test düğmelerine verir (bitmap yalnızca bu çağrı boyunca geçerli)
-    private fun deliverFrame(bmp: Bitmap) {
-        if (frameWaiters.isEmpty()) return
-        val list = ArrayList(frameWaiters)
-        frameWaiters.clear()
-        for (w in list) {
-            try {
-                w.cb(bmp)
-            } catch (e: Exception) {
-                logRead("kare geri çağrısı hatası: ${e.javaClass.simpleName} ${e.message?.take(60) ?: ""}")
-            }
-        }
-    }
-
-    private fun toast(s: String) {
-        ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
-    }
-}
+         
