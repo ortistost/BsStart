@@ -534,7 +534,7 @@ class MainActivity : Activity() {
         val ord = Sec("order", "KURULUM SIRASI")
         val orderNotes = arrayOf(
             "", "zorunlu", "zorunlu", "", "zorunlu", "zorunlu",
-            "karakter değiştirme", "karakter değiştirme, renge bakmaz", "karakter değiştirme, renge bakmaz"
+            "karakter değiştirme, renge bakmaz (5 sn sonra basılır)", "renge bakmaz (6'dan 5 sn sonra)", "renge bakmaz (7'den 5 sn sonra)"
         )
         ord.body.addView(txt("Panelde \"Yuva kaydet\" sıradaki boş yuvayı kaydeder. Bu sırayla kaydet:", 12f, SUB)
             .apply { setPadding(0, dp(6), 0, dp(6)) })
@@ -642,6 +642,109 @@ class MainActivity : Activity() {
             } else {
                 aifErr.text = ""
                 if (sp.getInt("aifpct", -1) != v) sp.edit().putInt("aifpct", v).apply()
+            }
+        }
+
+        // Ters if basış hızı
+        sc.body.addView(txt("Ters if basışı (saniyede, 0.1-10)", 14f).apply { setPadding(0, dp(14), 0, 0) })
+        val nifEt = decimalField("3", 1).apply {
+            setText(fmtNum(
+                sp.getFloat("nifrate", SlotStore.DEFAULT_NIF_RATE)
+                    .coerceIn(SlotStore.MIN_ATK_RATE, SlotStore.MAX_ATK_RATE), 1))
+        }
+        sc.body.addView(nifEt)
+        sc.body.addView(txt("Saldırıya (yuva 2) ters if konduysa saldırı bu hızda basar.", 12f, SUB).apply { setPadding(0, dp(4), 0, 0) })
+        val nifErr = txt("", 12f, Color.parseColor("#FF5252")).apply { setPadding(0, dp(6), 0, 0) }
+        sc.body.addView(nifErr)
+        watch(nifEt) { t ->
+            val err = decimalError(t, 1)
+            val v = t.trim().toFloatOrNull()
+            if (err != null) {
+                nifErr.text = err
+            } else if (v == null || v < SlotStore.MIN_ATK_RATE || v > SlotStore.MAX_ATK_RATE) {
+                nifErr.text = "0.1 ile 10 arasında bir sayı gir"
+            } else {
+                nifErr.text = ""
+                val r = Math.round(v * 10f) / 10f
+                if (Math.abs(sp.getFloat("nifrate", SlotStore.DEFAULT_NIF_RATE) - r) > 0.001f)
+                    sp.edit().putFloat("nifrate", r).apply()
+            }
+        }
+
+        // Ters if% eşiği
+        sc.body.addView(txt("Ters if% eşiği (%25-%100)", 14f).apply { setPadding(0, dp(14), 0, 0) })
+        val naifEt = field("80", InputType.TYPE_CLASS_NUMBER).apply {
+            setText(sp.getInt("naifpct", SlotStore.DEFAULT_NAIF)
+                .coerceIn(SlotStore.MIN_AIF, SlotStore.MAX_AIF).toString())
+        }
+        sc.body.addView(naifEt)
+        sc.body.addView(txt("Seçilen alan bu yüzdenin ALTINDA uyuyorsa (örn. %75 uyuyor, eşik %80) \"uymuyor\" sayılır ve ters if% basar.", 12f, SUB).apply { setPadding(0, dp(4), 0, 0) })
+        val naifErr = txt("", 12f, Color.parseColor("#FF5252")).apply { setPadding(0, dp(6), 0, 0) }
+        sc.body.addView(naifErr)
+        watch(naifEt) { t ->
+            val v = t.trim().toIntOrNull()
+            if (v == null || v < SlotStore.MIN_AIF || v > SlotStore.MAX_AIF) {
+                naifErr.text = "${SlotStore.MIN_AIF} ile ${SlotStore.MAX_AIF} arasında bir sayı gir"
+            } else {
+                naifErr.text = ""
+                if (sp.getInt("naifpct", -1) != v) sp.edit().putInt("naifpct", v).apply()
+            }
+        }
+
+        // Renk payı + önizleme
+        sc.body.addView(txt("Renk payı (${SlotStore.MIN_CTOL}-${SlotStore.MAX_CTOL})", 14f).apply { setPadding(0, dp(14), 0, 0) })
+        val ctolEt = field("35", InputType.TYPE_CLASS_NUMBER).apply {
+            setText(sp.getInt("ctol", SlotStore.DEFAULT_CTOL)
+                .coerceIn(SlotStore.MIN_CTOL, SlotStore.MAX_CTOL).toString())
+        }
+        sc.body.addView(ctolEt)
+        sc.body.addView(txt("Kayıtlı renkle ekrandaki renk arasında R, G ve B'nin HER BİRİ en fazla bu kadar farklı olabilir " +
+            "(0-255 ölçeğinde). Küçük pay: sıkı eşleşme (yanlış basma az, ama ışık/parlaklık farkında kaçırır). " +
+            "Büyük pay: gevşek eşleşme (kaçırma az, ama benzer renkle karışabilir). Yuva 1 için +13 ek pay uygulanır.", 12f, SUB)
+            .apply { setPadding(0, dp(4), 0, 0) })
+        val ctolErr = txt("", 12f, Color.parseColor("#FF5252")).apply { setPadding(0, dp(6), 0, 0) }
+        sc.body.addView(ctolErr)
+        val exRef = Color.parseColor("#6A8FD8")
+        fun swatch(c: Int) = View(this).apply {
+            background = GradientDrawable().apply {
+                setColor(c); cornerRadius = dp(6).toFloat(); setStroke(dp(1), Color.WHITE)
+            }
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { setMargins(dp(3), dp(6), dp(3), dp(6)) }
+        }
+        val prevRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val swDark = swatch(exRef); val swRef = swatch(exRef); val swLight = swatch(exRef)
+        prevRow.addView(swDark); prevRow.addView(swRef); prevRow.addView(swLight)
+        sc.body.addView(prevRow)
+        val strip = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(14))
+                .apply { setMargins(dp(3), 0, dp(3), dp(4)) }
+        }
+        sc.body.addView(strip)
+        val ctolInfo = txt("", 12f, Color.WHITE).apply { setPadding(0, dp(2), 0, 0) }
+        sc.body.addView(ctolInfo)
+        fun hx(c: Int) = String.format(java.util.Locale.US, "#%06X", c and 0xFFFFFF)
+        fun showCtol(tol: Int) {
+            fun sh(c: Int, dlt: Int) = Color.rgb(
+                (Color.red(c) + dlt).coerceIn(0, 255), (Color.green(c) + dlt).coerceIn(0, 255),
+                (Color.blue(c) + dlt).coerceIn(0, 255))
+            val dark = sh(exRef, -tol); val light = sh(exRef, tol)
+            (swDark.background as GradientDrawable).setColor(dark)
+            (swLight.background as GradientDrawable).setColor(light)
+            strip.background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(dark, exRef, light))
+                .apply { cornerRadius = dp(6).toFloat() }
+            ctolInfo.text = "Örnek: kayıtlı renk ${hx(exRef)} (ortadaki kutu). Pay ±$tol ile soldaki ${hx(dark)} " +
+                "(en koyu), sağdaki ${hx(light)} (en açık) ve aradaki her şey kabul edilir. " +
+                "Şeritteki tüm renkler 'aynı renk' sayılır; bunun dışındakiler sayılmaz. Yuva 1 için ±${tol + 13}."
+        }
+        showCtol(sp.getInt("ctol", SlotStore.DEFAULT_CTOL).coerceIn(SlotStore.MIN_CTOL, SlotStore.MAX_CTOL))
+        watch(ctolEt) { t ->
+            val v = t.trim().toIntOrNull()
+            if (v == null || v < SlotStore.MIN_CTOL || v > SlotStore.MAX_CTOL) {
+                ctolErr.text = "${SlotStore.MIN_CTOL} ile ${SlotStore.MAX_CTOL} arasında bir sayı gir"
+            } else {
+                ctolErr.text = ""
+                showCtol(v)
+                if (sp.getInt("ctol", -1) != v) sp.edit().putInt("ctol", v).apply()
             }
         }
         col.addView(sc.card)
