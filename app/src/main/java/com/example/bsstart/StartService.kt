@@ -2415,4 +2415,60 @@ class StartService : AccessibilityService() {
                         } finally {
                             result.hardwareBuffer.close()
                             shotBusy = false
-         
+                        }
+                        try { done(bmp) } finally { bmp?.recycle() }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        shotBusy = false
+                        done(null)
+                    }
+                })
+        } catch (e: Exception) {
+            shotBusy = false
+            logRead("ekran görüntüsü hatası: ${e.javaClass.simpleName} ${e.message?.take(60) ?: ""}")
+            done(null)
+        }
+    }
+
+    // Tarama zaten ~0,35 sn'de bir ekran görüntüsü alıyor; Android iki görüntü arasında en az bir süre
+    // bekletir (bildiğim kadarıyla yaklaşık 0,33 sn). Test düğmeleri ayrı görüntü istemek yerine taramanın
+    // bir sonraki karesini bekler; tarama yoksa ya da kare gelmezse eski yöntemle kendi görüntüsünü alır.
+    private fun withScreenshotWait(tries: Int = 15, done: (Bitmap?) -> Unit) {
+        if (!scanRunning) { shotRetry(tries, done); return }
+        val w = FrameWaiter(done)
+        frameWaiters.add(w)
+        ui.postDelayed({
+            if (frameWaiters.remove(w)) shotRetry(tries, done)
+        }, FRAME_WAIT_MS)
+    }
+
+    // Meşgul veya sistem aralık hatası verirse bekleyip tekrar dener (en fazla ~2,3 sn)
+    private fun shotRetry(tries: Int, done: (Bitmap?) -> Unit) {
+        withScreenshot { bmp ->
+            if (bmp == null && tries > 0) {
+                ui.postDelayed({ shotRetry(tries - 1, done) }, 150)
+            } else {
+                done(bmp)
+            }
+        }
+    }
+
+    // Tarama karesini bekleyen test düğmelerine verir (bitmap yalnızca bu çağrı boyunca geçerli)
+    private fun deliverFrame(bmp: Bitmap) {
+        if (frameWaiters.isEmpty()) return
+        val list = ArrayList(frameWaiters)
+        frameWaiters.clear()
+        for (w in list) {
+            try {
+                w.cb(bmp)
+            } catch (e: Exception) {
+                logRead("kare geri çağrısı hatası: ${e.javaClass.simpleName} ${e.message?.take(60) ?: ""}")
+            }
+        }
+    }
+
+    private fun toast(s: String) {
+        ui.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+    }
+}
