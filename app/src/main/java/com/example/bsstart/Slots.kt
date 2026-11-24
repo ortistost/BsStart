@@ -9,14 +9,14 @@ object SlotStore {
     const val REC = "bsrec"
     const val DEFAULT_LIMIT = 475
     const val MIN_LIMIT = 1
-    const val DEFAULT_AIF = 90    // if% eşiği (%)
+    const val DEFAULT_AIF = 80    // if% eşiği (%)
     const val MIN_AIF = 25
     const val MAX_AIF = 100
     const val MAX_LIMIT = 3000
     const val MIN_SCALE = 0.5f
     const val MAX_SCALE = 1.5f
     const val DEFAULT_ATK_RATE = 3f   // Saldırı (yuva 2) basışı, saniyede kaç kez
-    const val MIN_ATK_RATE = 0.3f
+    const val MIN_ATK_RATE = 0.1f
     const val MAX_ATK_RATE = 10f
     const val MAX_RECORDS = 10        // en fazla kayıt sayısı
     const val SLOTS = 18          // 1-8 yuvalar, 11-18 = if (1)..if (8)
@@ -28,28 +28,11 @@ object SlotStore {
         "Savaşçılar", "Karakter", "Seç", "", "",
         "if (1)", "if (2)", "if (3)", "if (4)", "if (5)", "if (6)", "if (7)", "if (8)"
     )
-    // Uygulamanın hazır ayarı. Kaynak: kullanıcının kendi kaydı, screen=2340x1080.
-    // Konumlar ekran oranı olduğundan başka çözünürlükte aynı yere denk gelir; renkler cihaza özgüdür.
-    val PRESET = listOf(
-        "$HEADER screen=2340x1080",
-        "1 Maça gir x=0.8645 y=0.8954 color=#D9D8D2",
-        "2 Saldırı x=0.8543 y=0.6565 color=#B3391B",
-        "3 Devam 1 x=0.9628 y=0.9194 color=#2373FF",
-        "4 Devam 2 x=0.9521 y=0.9259 color=#2373FF",
-        "5 Çıkış x=0.9603 y=0.9231 color=#2373FF",
-        "6 Savaşçılar x=0.1013 y=0.4435 color=#353C52",
-        "7 Karakter x=0.3128 y=0.2315 color=#B116EC",
-        "8 Seç x=0.0902 y=0.8815 color=#EFC609",
-        "12 if (2) x=0.0410 y=0.0593 color=#08105E",
-        "OCR x1=0.4064 y1=0.1269 x2=0.6338 y2=0.2269",
-        "SET limit=475 scale=1.00 tot=1"
-    ).joinToString("\n")
-
     val BUTTONS = listOf(
         "move" to "Taşı", "mini" to "Küçült / Büyült", "main" to "Başlat / Durdur",
         "calib" to "Yuva kaydet", "if" to "If", "aif" to "If%", "del" to "Hepsini sil", "undo" to "Geri al",
         "eye" to "Halkalar", "area" to "Alan seç", "live" to "Test oku",
-        "tot" to "Toplam", "save" to "Kaydet", "colors" to "Renkler", "off" to "Gizle"
+        "tot" to "Toplam", "save" to "Kaydet", "colors" to "Renkler", "close" to "Kapat", "off" to "Gizle"
     )
 
     fun btnOn(sets: SharedPreferences, key: String) = sets.getBoolean("btn_$key", true)
@@ -270,49 +253,6 @@ object SlotStore {
         return ok
     }
 
-    // Hazır ayardan yalnızca eksik olanları doldurur, var olan hiçbir değeri ezmez.
-    // Hiç temel yuva yoksa hepsini alır; varsa sadece kupa kısmını (yuva 6-8, okuma alanı, ayarlar).
-    // Doldurulan öğe sayısını döndürür.
-    fun fillMissing(p: SharedPreferences, d: Parsed, sets: SharedPreferences?): Int {
-        val trophyOnly = coreReady(p)
-        val e = p.edit()
-        var n = 0
-        for (i in 1..SLOTS) {
-            if (!d.have[i] || ready(p, i)) continue
-            if (trophyOnly && i !in 6..8) continue
-            e.putFloat("x$i", d.xs[i]).putFloat("y$i", d.ys[i]).putInt("c$i", d.colors[i])
-            n++
-        }
-        d.rect?.let {
-            if (!rectReady(p)) {
-                e.putFloat("ox1", it[0]).putFloat("oy1", it[1])
-                    .putFloat("ox2", it[2]).putFloat("oy2", it[3])
-                n++
-            }
-        }
-        if (!trophyOnly) {
-            d.tot?.let {
-                if (!totReady(p)) {
-                    e.putFloat("tx1", it[0]).putFloat("ty1", it[1])
-                        .putFloat("tx2", it[2]).putFloat("ty2", it[3])
-                    n++
-                }
-            }
-        }
-        if (n > 0) e.commit()
-        val st = d.set
-        if (st != null && sets != null) {
-            val se = sets.edit()
-            if (!sets.contains("limit")) se.putInt("limit", st.first)
-            if (!trophyOnly) {
-                if (!sets.contains("scale")) se.putFloat("scale", st.second)
-                if (!sets.contains("ttot")) se.putBoolean("ttot", st.third)
-            }
-            se.commit()
-        }
-        return n
-    }
-
     // --- Kayıtlar (r1, r2, ... metin; n1, n2, ... isim) ---
 
     fun recList(r: SharedPreferences): List<Pair<Int, String>> =
@@ -335,8 +275,19 @@ object SlotStore {
         return n to true
     }
 
-    fun recDelete(r: SharedPreferences, n: Int) {
-        r.edit().remove("r$n").remove("n$n").commit()
+    fun recLocked(r: SharedPreferences, n: Int) = r.getBoolean("l$n", false)
+
+    fun recSetLock(r: SharedPreferences, n: Int, on: Boolean) {
+        val e = r.edit()
+        if (on) e.putBoolean("l$n", true) else e.remove("l$n")
+        e.commit()
+    }
+
+    // Kilitli kayıt silinmez. Silindiyse true.
+    fun recDelete(r: SharedPreferences, n: Int): Boolean {
+        if (recLocked(r, n)) return false
+        r.edit().remove("r$n").remove("n$n").remove("l$n").commit()
+        return true
     }
 
     fun recName(r: SharedPreferences, n: Int): String? =
